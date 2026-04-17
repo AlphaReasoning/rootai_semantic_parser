@@ -1,0 +1,19 @@
+{
+  "plugins": [
+    {
+      "name": "spring-rules",
+      "type": "ruleset",
+      "description": "Community-maintained Spring controller and deserialization rules"
+    },
+    {
+      "name": "fastapi-rules",
+      "type": "ruleset",
+      "description": "FastAPI request binding, dependency injection, and auth guard rules"
+    },
+    {
+      "name": "gin-rules",
+      "type": "ruleset",
+      "description": "Gin route, binder, and middleware taint rules"
+    }
+  ]
+}

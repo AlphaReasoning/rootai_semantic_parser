@@ -1,0 +1,5 @@
+{
+  "sources": ["req.body", "req.query", "req.params", "body", "query", "params", "email", "criteria", "user_input"],
+  "sinks": ["sequelize.query", "execute", "db.execute", "find", "$where", "eval", "exec", "child_process.exec", "child_process.execSync", "mongo.connect"],
+  "sanitizers": ["int", "str", "Number", "parseInt"]
+}

@@ -1,0 +1,5 @@
+{
+  "sources": ["alpha_sidecar_results.json", "req.body", "req.query"],
+  "sinks": ["subprocess.check_output", "subprocess.run", "os.system", "db.execute", "os.system", "subprocess.Popen"],
+  "sanitizers": ["int", "str"]
+}
