@@ -11,12 +11,14 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from analyzers.symbols import SymbolResolver
 from analyzers.taint import TaintAnalyzer
 from models import AnalysisOptions, Edge, LogicClass, Node, ScanReport, SecurityConfig, TaintConfig
 from parsers.registry import iter_parser_classes
+from version import __version__
 
 log = logging.getLogger(__name__)
 
@@ -228,6 +230,7 @@ class MultiFileParser:
         exclude_patterns: Optional[List[str]] = None,
         options: Optional[AnalysisOptions] = None,
         use_cache: bool = True,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.root = root
         self.config = security_config or SecurityConfig.default_web()
@@ -236,7 +239,15 @@ class MultiFileParser:
         self._parser_classes: List[type] = list(iter_parser_classes())
         self._parsers: List[Any] = []
         self._parsed = False
-        self._cache = ParseCache("0.20.0", self.options, self.config) if use_cache else None
+        self._cache = ParseCache(__version__, self.options, self.config) if use_cache else None
+        self._event_callback = event_callback
+
+    def _emit(self, stage: str, message: str, **payload: Any) -> None:
+        if not self._event_callback:
+            return
+        event = {"ts": time.time(), "stage": stage, "message": message}
+        event.update(payload)
+        self._event_callback(event)
 
     def _is_excluded(self, path: str) -> bool:
         parts = path.replace("\\", "/").split("/")
@@ -248,17 +259,20 @@ class MultiFileParser:
             return
         self._parsed = True
         files_to_parse: List[str] = []
+        self._emit("discover", "Walking repository and selecting candidate files.", root=self.root)
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if not any(fnmatch.fnmatch(d, pat) for pat in self._excludes)]
             for fname in filenames:
                 fpath = os.path.join(dirpath, fname)
                 if not self._is_excluded(fpath):
                     files_to_parse.append(fpath)
+        self._emit("discover", "Repository walk complete.", file_count=len(files_to_parse))
         if self.options.quick_mode:
             files_to_parse = [
                 path for path in files_to_parse
                 if not any(token in path.lower() for token in ("/test", "/tests", "_test.", ".spec.", ".test.", "/fixtures/", "/examples/"))
             ]
+            self._emit("discover", "Quick mode filtered test and fixture files.", filtered_file_count=len(files_to_parse))
 
         def _parse_file(fpath: str):
             if self._cache:
@@ -275,14 +289,25 @@ class MultiFileParser:
             return None
 
         max_workers = min(32, (os.cpu_count() or 1) + 4)
+        parsed_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             iterator = as_completed({executor.submit(_parse_file, path): path for path in files_to_parse})
             if tqdm is not None:
                 iterator = tqdm(iterator, total=len(files_to_parse), desc="parse", unit="file")
             for future in iterator:
                 parser = future.result()
+                parsed_count += 1
                 if parser:
                     self._parsers.append(parser)
+                if parsed_count == 1 or parsed_count == len(files_to_parse) or parsed_count % 25 == 0:
+                    self._emit(
+                        "parse",
+                        "Parser workers are processing source files.",
+                        parsed_count=parsed_count,
+                        candidate_file_count=len(files_to_parse),
+                        parser_count=len(self._parsers),
+                    )
+        self._emit("parse", "Parsing complete.", parsed_count=parsed_count, parser_count=len(self._parsers))
 
     def parse_changed_files(self, changed_files: List[str]) -> None:
         """Parse only a provided list of changed files."""
@@ -290,6 +315,7 @@ class MultiFileParser:
             return
         self._parsed = True
         selected = [path for path in changed_files if os.path.isfile(path) and not self._is_excluded(path)]
+        self._emit("discover", "Scanning only changed files.", file_count=len(selected))
 
         def _parse_file(fpath: str):
             if self._cache:
@@ -306,17 +332,21 @@ class MultiFileParser:
             return None
 
         max_workers = min(32, (os.cpu_count() or 1) + 4)
+        parsed_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             iterator = as_completed({executor.submit(_parse_file, path): path for path in selected})
             if tqdm is not None:
                 iterator = tqdm(iterator, total=len(selected), desc="parse-changed", unit="file")
             for future in iterator:
                 parser = future.result()
+                parsed_count += 1
                 if parser:
                     self._parsers.append(parser)
+        self._emit("parse", "Changed-file parsing complete.", parsed_count=parsed_count, parser_count=len(self._parsers))
 
     def get_graph(self) -> Dict:
         """Merge parsed files into a graph."""
+        self._emit("graph", "Merging parser outputs into a semantic graph.", parser_count=len(self._parsers))
         merged_nodes: Dict[str, Dict] = {}
         merged_edges: Dict[Tuple[str, str, str], Dict] = {}
         for parser in self._parsers:
@@ -332,7 +362,15 @@ class MultiFileParser:
                 else:
                     merged_edges[key] = asdict(edge)
         graph = {"nodes": list(merged_nodes.values()), "edges": list(merged_edges.values())}
-        return SymbolResolver(graph).run()
+        resolved = SymbolResolver(graph).run()
+        self._emit(
+            "graph",
+            "Graph merge and symbol resolution complete.",
+            node_count=len(resolved.get("nodes", [])),
+            edge_count=len(resolved.get("edges", [])),
+            unresolved=resolved.get("_resolution_stats", {}).get("unresolved", 0),
+        )
+        return resolved
 
     def scan(
         self,
@@ -341,6 +379,7 @@ class MultiFileParser:
         external_graphs: Optional[List[Dict]] = None,
     ) -> ScanReport:
         """Parse and analyze a repository."""
+        self._emit("scan", "Semantic scan starting.", root=self.root, profile=self.options.profile)
         self.parse_all()
         graph = self.get_graph()
         if external_graphs:
@@ -348,20 +387,32 @@ class MultiFileParser:
             for i, ext_graph in enumerate(external_graphs):
                 gdr.ingest(ext_graph, prefix=f"ext_{i}_")
             graph = gdr.resolve()
+            self._emit("graph", "External dependency graphs merged.", dependency_graphs=len(external_graphs))
         if cve_enricher:
-            cve_enricher.enrich_graph(graph)
+            enriched_count = cve_enricher.enrich_graph(graph)
+            self._emit("enrich", "CVE enrichment applied.", enriched_edges=enriched_count)
+        self._emit("taint", "Running taint analysis and path ranking.")
         analyzer = TaintAnalyzer(graph, taint_config or TaintConfig(), options=self.options)
         paths = analyzer.run()
         severity_summary: Dict[str, int] = {}
         for tp in paths:
             severity_summary[tp.severity] = severity_summary.get(tp.severity, 0) + 1
         severity_summary["total"] = len(paths)
+        self._emit("taint", "Taint analysis complete.", taint_path_count=len(paths), severity_summary=severity_summary)
         pii_ids = {n["id"] for n in graph["nodes"] if n.get("is_pii_sensitive")}
         top_risks = sorted(
             [e for e in graph["edges"] if e.get("source") in pii_ids or e.get("target") in pii_ids],
             key=lambda e: e.get("fragility_score", 0),
             reverse=True,
         )[:10]
+        self._emit(
+            "report",
+            "Scan report assembled.",
+            node_count=len(graph["nodes"]),
+            edge_count=len(graph["edges"]),
+            pii_node_count=len(pii_ids),
+            top_risk_count=len(top_risks),
+        )
         return ScanReport(
             graph=graph,
             taint_paths=[asdict(tp) for tp in paths],

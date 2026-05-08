@@ -1,7 +1,5 @@
-﻿streamlit
-pydantic
-tree-sitter
-# Add any other core dependencies for rootai here
+fastapi>=0.115,<1
+streamlit>=1.44,<2
 pydantic>=2.8,<3
 tqdm>=4.66,<5
 tree-sitter>=0.24,<0.26

@@ -12,6 +12,7 @@ class NodeType(str, Enum):
     """Supported graph node types."""
 
     MODULE = "Module"
+    IMPORT = "Import"
     CLASS = "Class"
     STRUCT = "Struct"
     FUNCTION = "Function"
@@ -34,6 +35,10 @@ class EdgeRelation(str, Enum):
     CALLS = "calls"
     DATAFLOW = "dataflow"
     IMPORTS = "imports"
+    CONTAINS = "contains"
+    RETURNS = "returns"
+    ALIAS_OF = "alias_of"
+    ATTRIBUTE_OF = "attribute_of"
     IMPLEMENTS = "implements"
     UNSAFE_ACCESS = "unsafe_access"
     INHERITS = "inherits"
@@ -66,6 +71,125 @@ _LOGIC_RANK: Dict[str, int] = {
 }
 VALID_NODE_TYPES: FrozenSet[str] = frozenset(t.value for t in NodeType)
 VALID_EDGE_RELATIONS: FrozenSet[str] = frozenset(r.value for r in EdgeRelation)
+IR_VERSION = "0.2.0"
+
+NODE_TYPE_SEMANTICS: Mapping[str, Dict[str, Any]] = {
+    NodeType.MODULE.value: {
+        "meaning": "A source file, package unit, or parser-emitted module boundary.",
+        "identity": "Stable hash of file path and module sentinel.",
+    },
+    NodeType.IMPORT.value: {
+        "meaning": "A static import binding visible from a module scope.",
+        "identity": "Stable hash of file path and local import alias.",
+    },
+    NodeType.CLASS.value: {
+        "meaning": "A class declaration discovered by the language parser.",
+        "identity": "Stable hash of file path and class symbol.",
+    },
+    NodeType.STRUCT.value: {
+        "meaning": "A struct or record declaration discovered by the language parser.",
+        "identity": "Stable hash of file path and struct symbol.",
+    },
+    NodeType.FUNCTION.value: {
+        "meaning": "A function, method, handler, resolver, or callable declaration/call target.",
+        "identity": "Stable hash of file path and callable symbol.",
+    },
+    NodeType.VARIABLE.value: {
+        "meaning": "A local variable, parameter, or SSA-versioned binding.",
+        "identity": "Stable hash of file path and binding label.",
+    },
+    NodeType.UNSAFE.value: {
+        "meaning": "A parser-identified unsafe operation or unsafe API surface.",
+        "identity": "Stable hash of file path and unsafe symbol.",
+    },
+    NodeType.INTERFACE.value: {
+        "meaning": "An interface, trait, protocol, or comparable contract declaration.",
+        "identity": "Stable hash of file path and interface symbol.",
+    },
+    NodeType.CONTROL.value: {
+        "meaning": "Synthetic control-flow plumbing node.",
+        "identity": "Parser-scoped synthetic id.",
+    },
+    NodeType.DATA.value: {
+        "meaning": "Synthetic expression/data node, including attribute dereferences.",
+        "identity": "Stable hash of file path and expression label.",
+    },
+    NodeType.MODULE_ND.value: {
+        "meaning": "Synthetic module-level data-flow plumbing node.",
+        "identity": "Parser-scoped synthetic id.",
+    },
+}
+
+EDGE_RELATION_SEMANTICS: Mapping[str, Dict[str, Any]] = {
+    EdgeRelation.CALLS.value: {
+        "meaning": "Source callable may invoke target callable under static resolution.",
+        "soundness": "Sound only for statically visible call expressions emitted by supported parsers.",
+        "completeness": "Incomplete for reflection, monkeypatching, generated code, dynamic dispatch, and unresolved imports.",
+    },
+    EdgeRelation.DATAFLOW.value: {
+        "meaning": "Value, taint, or symbolic data may propagate from source node to target node.",
+        "soundness": "Conservative for parser-observed assignments, arguments, returns, and attribute dereferences.",
+        "completeness": "Incomplete for aliasing not present in the AST/regex model and for runtime metaprogramming.",
+    },
+    EdgeRelation.IMPORTS.value: {
+        "meaning": "Module source imports or binds the target symbol.",
+        "soundness": "Static import declarations only.",
+        "completeness": "Incomplete for runtime import hooks and dynamically computed module names.",
+    },
+    EdgeRelation.CONTAINS.value: {
+        "meaning": "Source lexical/container node contains target declaration.",
+        "soundness": "Sound for parser-discovered lexical containment.",
+        "completeness": "Parser-language dependent.",
+    },
+    EdgeRelation.RETURNS.value: {
+        "meaning": "Source expression may be returned by target callable.",
+        "soundness": "Static return statements only.",
+        "completeness": "Incomplete for exceptions, generators, callbacks, and framework-mediated returns.",
+    },
+    EdgeRelation.ALIAS_OF.value: {
+        "meaning": "Source binding is an alias for target binding or imported symbol.",
+        "soundness": "Static alias/import assignments only.",
+        "completeness": "Incomplete for mutation-heavy aliasing and dynamic binding.",
+    },
+    EdgeRelation.ATTRIBUTE_OF.value: {
+        "meaning": "Source attribute/data expression is derived from target base expression.",
+        "soundness": "Static attribute expressions only.",
+        "completeness": "Incomplete for descriptor behavior and dynamic attribute access.",
+    },
+    EdgeRelation.IMPLEMENTS.value: {
+        "meaning": "Source type implements target interface/contract.",
+        "soundness": "Parser-discovered declarations only.",
+        "completeness": "Language/parser dependent.",
+    },
+    EdgeRelation.UNSAFE_ACCESS.value: {
+        "meaning": "Source reaches an operation classified as unsafe by the active profile.",
+        "soundness": "Profile keyword and parser metadata based.",
+        "completeness": "Incomplete for custom unsafe abstractions not represented in the active rules.",
+    },
+    EdgeRelation.INHERITS.value: {
+        "meaning": "Source class/type inherits from target class/type.",
+        "soundness": "Static inheritance syntax only.",
+        "completeness": "Incomplete for runtime class generation and mixins not represented statically.",
+    },
+}
+
+IR_GUARANTEES: Mapping[str, str] = {
+    "determinism": "For the same files, parser version, config, and cache namespace, graph ids and deterministic query results are stable.",
+    "provenance": "Parser-created nodes carry file, line, language, qualified name, and origin metadata when available.",
+    "resolution": "Call/import resolution is static and records unresolved edges in graph resolution stats.",
+    "llm_boundary": "LLMs may interpret exported context, but graph traversal and path discovery are deterministic library operations.",
+    "non_claim": "The IR is a structured reasoning prior, not a formal verification proof system.",
+}
+
+
+def formal_ir_spec() -> Dict[str, Any]:
+    """Return the machine-readable formal IR contract."""
+    return {
+        "ir_version": IR_VERSION,
+        "node_types": NODE_TYPE_SEMANTICS,
+        "edge_relations": EDGE_RELATION_SEMANTICS,
+        "guarantees": IR_GUARANTEES,
+    }
 
 
 @dataclass
@@ -973,12 +1097,17 @@ __all__ = [
     "BountyReport",
     "Edge",
     "EdgeRelation",
+    "EDGE_RELATION_SEMANTICS",
     "GraphDiff",
+    "IR_GUARANTEES",
+    "IR_VERSION",
     "LogicClass",
     "Node",
+    "NODE_TYPE_SEMANTICS",
     "NodeType",
     "ScanReport",
     "SecurityConfig",
     "TaintConfig",
     "TaintPath",
+    "formal_ir_spec",
 ]

@@ -107,8 +107,11 @@ class LanguageParser:
             logic_class=logic.value,
         )
 
-    def _edge(self, src: str, tgt: str, rel: EdgeRelation) -> Edge:
-        return Edge(source=src, target=tgt, relation=rel.value)
+    def _edge(self, src: str, tgt: str, rel: EdgeRelation, metadata: Optional[Dict[str, Any]] = None) -> Edge:
+        edge = Edge(source=src, target=tgt, relation=rel.value)
+        if metadata:
+            edge.metadata.update(metadata)
+        return edge
 
 
 class TreeSitterParser(LanguageParser):
@@ -160,6 +163,7 @@ class PythonParser(LanguageParser):
     def __init__(self, config: SecurityConfig, options: Optional[AnalysisOptions] = None) -> None:
         super().__init__(config, options=options)
         self.ssa = SSAVersionTracker()
+        self._import_aliases: Dict[str, Dict[str, Any]] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -175,16 +179,33 @@ class PythonParser(LanguageParser):
 
         module_id = self._make_id(path, "__module__")
         self.nodes[module_id] = self._make_node(module_id, NodeType.MODULE, os.path.basename(path), path)
+        self._import_aliases = {}
         fn_ranges: List[Tuple[int, int, str]] = []
         class_map: Dict[str, str] = {}
         deferred_calls: List[ast.Call] = []
         deferred_assigns: List[ast.AST] = []
 
         for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self._record_import(path, module_id, node)
+
+        for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 cid = self._make_id(path, node.name)
                 self.nodes[cid] = self._make_node(cid, NodeType.CLASS, node.name, path, node.lineno)
                 class_map[node.name] = cid
+                self.edges.append(self._edge(module_id, cid, EdgeRelation.CONTAINS))
+                for base in node.bases:
+                    base_name = self._expr_name(base)
+                    if base_name:
+                        self.edges.append(
+                            self._edge(
+                                cid,
+                                self._make_id(path, base_name),
+                                EdgeRelation.INHERITS,
+                                {"static": True, "target_symbol": base_name},
+                            )
+                        )
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 nid = self._make_id(path, node.name)
                 self.nodes[nid] = self._make_node(nid, NodeType.FUNCTION, node.name, path, node.lineno)
@@ -202,7 +223,7 @@ class PythonParser(LanguageParser):
                     cls_node = self.nodes.get(cls_id)
                     if cls_node and cls_node.lineno and node.lineno > cls_node.lineno:
                         parent_id = cls_id
-                self.edges.append(self._edge(parent_id, nid, EdgeRelation.IMPORTS))
+                self.edges.append(self._edge(parent_id, nid, EdgeRelation.CONTAINS))
                 end = getattr(node, "end_lineno", node.lineno + 999)
                 fn_ranges.append((node.lineno, end, nid))
                 args_list = list(getattr(node.args, "posonlyargs", [])) + list(node.args.args) + list(getattr(node.args, "kwonlyargs", []))
@@ -215,18 +236,18 @@ class PythonParser(LanguageParser):
                     ssa_label = arg_name if self.options.quick_mode else self.ssa.get_versioned_id(arg_name)
                     var_id = self._make_id(path, ssa_label)
                     self.nodes[var_id] = self._make_node(var_id, NodeType.VARIABLE, ssa_label, path, node.lineno)
-                    self.edges.append(self._edge(nid, var_id, EdgeRelation.DATAFLOW))
+                    self.edges.append(self._edge(nid, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "parameter"}))
             elif isinstance(node, ast.Call):
                 deferred_calls.append(node)
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                 deferred_assigns.append(node)
             elif isinstance(node, ast.Return) and node.value is not None:
                 enclosing = self._enclosing(getattr(node, "lineno", 0), fn_ranges, module_id)
-                for sub_node in ast.walk(node.value):
-                    if isinstance(sub_node, ast.Name) and isinstance(sub_node.ctx, ast.Load):
-                        curr_label = sub_node.id if self.options.quick_mode else self.ssa.get_current_id(sub_node.id)
-                        if curr_label:
-                            self.edges.append(self._edge(self._make_id(path, curr_label), enclosing, EdgeRelation.DATAFLOW))
+                for ref_label in self._value_refs(node.value):
+                    ref_id = self._reference_id(path, ref_label, getattr(node, "lineno", 0), taint_sources=set())
+                    if ref_id:
+                        self.edges.append(self._edge(ref_id, enclosing, EdgeRelation.DATAFLOW, {"flow_kind": "return"}))
+                        self.edges.append(self._edge(ref_id, enclosing, EdgeRelation.RETURNS))
 
         fn_ranges.sort()
         deferred_assigns.sort(key=lambda x: getattr(x, "lineno", 0))
@@ -236,7 +257,10 @@ class PythonParser(LanguageParser):
             if not value_node:
                 continue
             rhs_str = ast.dump(value_node).lower()
-            is_source = any(s in rhs_str for s in taint_sources)
+            value_refs = self._value_refs(value_node)
+            is_source = any(s in rhs_str for s in taint_sources) or any(
+                any(s in ref.lower() for s in taint_sources) for ref in value_refs
+            )
             assign_line = getattr(assign_node, "lineno", 0)
             enclosing = self._enclosing(assign_line, fn_ranges, module_id)
             targets = assign_node.targets if isinstance(assign_node, ast.Assign) else [assign_node.target]
@@ -250,27 +274,28 @@ class PythonParser(LanguageParser):
                         self.nodes[var_id] = self._make_node(var_id, NodeType.VARIABLE, ssa_label, path, assign_line)
                         if is_source:
                             self.nodes[var_id].is_unsafe = True
-                        self.edges.append(self._edge(enclosing, var_id, EdgeRelation.DATAFLOW))
+                        self.edges.append(self._edge(enclosing, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "assignment"}))
                         prev_ver_num = self.ssa.counters.get(var_name, 0) - 1
                         if not self.options.quick_mode and prev_ver_num > 0:
                             prev_label = f"{var_name}_v{prev_ver_num}"
-                            self.edges.append(self._edge(self._make_id(path, prev_label), var_id, EdgeRelation.DATAFLOW))
+                            self.edges.append(self._edge(self._make_id(path, prev_label), var_id, EdgeRelation.DATAFLOW, {"flow_kind": "ssa"}))
                         new_target_ids.append(var_id)
+            for ref_label in value_refs:
+                rhs_id = self._reference_id(path, ref_label, assign_line, taint_sources=taint_sources)
+                if not rhs_id:
+                    continue
+                for tid in new_target_ids:
+                    self.edges.append(self._edge(rhs_id, tid, EdgeRelation.DATAFLOW, {"flow_kind": "assignment_rhs"}))
+                    if self.nodes.get(rhs_id) and self.nodes[rhs_id].is_unsafe:
+                        self.nodes[tid].is_unsafe = True
             for sub_node in ast.walk(value_node):
-                if isinstance(sub_node, ast.Name) and isinstance(sub_node.ctx, ast.Load):
-                    curr_rhs_label = sub_node.id if self.options.quick_mode else self.ssa.get_current_id(sub_node.id)
-                    if curr_rhs_label:
-                        rhs_id = self._make_id(path, curr_rhs_label)
-                        for tid in new_target_ids:
-                            self.edges.append(self._edge(rhs_id, tid, EdgeRelation.DATAFLOW))
-                            if self.nodes.get(rhs_id) and self.nodes[rhs_id].is_unsafe:
-                                self.nodes[tid].is_unsafe = True
-                elif isinstance(sub_node, ast.Call):
+                if isinstance(sub_node, ast.Call):
                     callee_name = self._call_name(sub_node)
                     if callee_name:
                         callee_id = self._make_id(path, callee_name)
+                        self._ensure_call_target(path, callee_name, getattr(sub_node, "lineno", assign_line))
                         for tid in new_target_ids:
-                            self.edges.append(self._edge(callee_id, tid, EdgeRelation.DATAFLOW))
+                            self.edges.append(self._edge(callee_id, tid, EdgeRelation.DATAFLOW, {"flow_kind": "call_return"}))
 
         for call_node in deferred_calls:
             callee_name = self._call_name(call_node)
@@ -279,18 +304,124 @@ class PythonParser(LanguageParser):
             callee_id = self._make_id(path, callee_name)
             call_line = getattr(call_node, "lineno", 0)
             caller_id = self._enclosing(call_line, fn_ranges, module_id)
-            if callee_id not in self.nodes:
-                self.nodes[callee_id] = self._make_node(callee_id, NodeType.FUNCTION, callee_name, path, call_line)
-            self.edges.append(self._edge(caller_id, callee_id, EdgeRelation.CALLS))
+            self._ensure_call_target(path, callee_name, call_line)
+            self.edges.append(self._edge(caller_id, callee_id, EdgeRelation.CALLS, {"static": True, "call_name": callee_name}))
             for arg in call_node.args:
-                for sub_node in ast.walk(arg):
-                    if isinstance(sub_node, ast.Name) and isinstance(sub_node.ctx, ast.Load):
-                        curr_arg_label = sub_node.id if self.options.quick_mode else self.ssa.get_current_id(sub_node.id)
-                        if curr_arg_label:
-                            arg_id = self._make_id(path, curr_arg_label)
-                            self.edges.append(self._edge(arg_id, callee_id, EdgeRelation.DATAFLOW))
-                            if self.nodes.get(arg_id) and self.nodes[arg_id].is_unsafe:
-                                self.nodes[callee_id].is_unsafe = True
+                for ref_label in self._value_refs(arg):
+                    arg_id = self._reference_id(path, ref_label, call_line, taint_sources=taint_sources)
+                    if arg_id:
+                        self.edges.append(self._edge(arg_id, callee_id, EdgeRelation.DATAFLOW, {"flow_kind": "call_argument"}))
+                        if self.nodes.get(arg_id) and self.nodes[arg_id].is_unsafe:
+                            self.nodes[callee_id].is_unsafe = True
+
+    def _record_import(self, path: str, module_id: str, node: ast.AST) -> None:
+        """Record static import bindings for later cross-file resolution."""
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".", 1)[0]
+                self._add_import_node(
+                    path,
+                    module_id,
+                    module_name=alias.name,
+                    import_name=None,
+                    local_name=local_name,
+                    lineno=getattr(node, "lineno", None),
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module_name = "." * int(getattr(node, "level", 0) or 0) + (node.module or "")
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                self._add_import_node(
+                    path,
+                    module_id,
+                    module_name=module_name,
+                    import_name=alias.name,
+                    local_name=alias.asname or alias.name,
+                    lineno=getattr(node, "lineno", None),
+                )
+
+    def _add_import_node(
+        self,
+        path: str,
+        module_id: str,
+        module_name: str,
+        import_name: Optional[str],
+        local_name: str,
+        lineno: Optional[int],
+    ) -> None:
+        import_id = self._make_id(path, f"import:{local_name}")
+        node = self._make_node(import_id, NodeType.IMPORT, local_name, path, lineno)
+        node.qualified_name = f"{module_name}.{import_name}" if import_name else module_name
+        node.metadata.update(
+            {
+                "symbol": local_name,
+                "import_module": module_name,
+                "import_name": import_name,
+                "import_alias": local_name,
+            }
+        )
+        self.nodes[import_id] = node
+        self._import_aliases[local_name] = node.metadata
+        self.edges.append(
+            self._edge(
+                module_id,
+                import_id,
+                EdgeRelation.IMPORTS,
+                {"module": module_name, "import_name": import_name, "alias": local_name},
+            )
+        )
+
+    def _ensure_call_target(self, path: str, callee_name: str, lineno: Optional[int]) -> str:
+        """Create a synthetic call target node when no local declaration exists."""
+        callee_id = self._make_id(path, callee_name)
+        if callee_id not in self.nodes:
+            node = self._make_node(callee_id, NodeType.FUNCTION, callee_name, path, lineno)
+            node.metadata.update({"synthetic": "call_target", "call_name": callee_name})
+            self.nodes[callee_id] = node
+        return callee_id
+
+    def _reference_id(self, path: str, label: str, lineno: Optional[int], taint_sources: Set[str]) -> Optional[str]:
+        """Resolve or create a graph node for a value expression reference."""
+        if "." not in label:
+            current_label = label if self.options.quick_mode else self.ssa.get_current_id(label)
+            if current_label:
+                node_id = self._make_id(path, current_label)
+                if node_id in self.nodes:
+                    return node_id
+            import_meta = self._import_aliases.get(label)
+            if import_meta:
+                return self._make_id(path, f"import:{label}")
+            return None
+
+        node_id = self._make_id(path, label)
+        if node_id not in self.nodes:
+            node = self._make_node(node_id, NodeType.DATA, label, path, lineno)
+            node.metadata.update({"expression": label, "symbol": label})
+            if any(source in label.lower() for source in taint_sources):
+                node.is_unsafe = True
+            self.nodes[node_id] = node
+        base_label = label.rsplit(".", 1)[0]
+        base_id = self._reference_id(path, base_label, lineno, taint_sources)
+        if base_id:
+            self.edges.append(self._edge(node_id, base_id, EdgeRelation.ATTRIBUTE_OF))
+            self.edges.append(self._edge(base_id, node_id, EdgeRelation.DATAFLOW, {"flow_kind": "attribute"}))
+            if self.nodes.get(base_id) and self.nodes[base_id].is_unsafe:
+                self.nodes[node_id].is_unsafe = True
+        return node_id
+
+    @classmethod
+    def _value_refs(cls, node: ast.AST) -> List[str]:
+        """Return deterministic value reference labels, including attributes."""
+        refs: Set[str] = set()
+        for sub_node in ast.walk(node):
+            if isinstance(sub_node, ast.Attribute) and isinstance(sub_node.ctx, ast.Load):
+                name = cls._expr_name(sub_node)
+                if name:
+                    refs.add(name)
+            elif isinstance(sub_node, ast.Name) and isinstance(sub_node.ctx, ast.Load):
+                refs.add(sub_node.id)
+        return sorted(refs, key=lambda item: (item.count("."), item))
 
     @staticmethod
     def _enclosing(line: int, fn_ranges: List[Tuple[int, int, str]], fallback: str) -> str:
@@ -299,14 +430,21 @@ class PythonParser(LanguageParser):
                 return fn_id
         return fallback
 
-    @staticmethod
-    def _call_name(call_node: ast.Call) -> Optional[str]:
-        if isinstance(call_node.func, ast.Name):
-            return call_node.func.id
-        if isinstance(call_node.func, ast.Attribute):
-            if isinstance(call_node.func.value, ast.Name):
-                return f"{call_node.func.value.id}.{call_node.func.attr}"
-            return call_node.func.attr
+    @classmethod
+    def _call_name(cls, call_node: ast.Call) -> Optional[str]:
+        return cls._expr_name(call_node.func)
+
+    @classmethod
+    def _expr_name(cls, node: ast.AST) -> Optional[str]:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = cls._expr_name(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        if isinstance(node, ast.Call):
+            return cls._expr_name(node.func)
+        if isinstance(node, ast.Subscript):
+            return cls._expr_name(node.value)
         return None
 
 
@@ -352,7 +490,7 @@ class JavaScriptParser(TreeSitterParser):
             metadata["entrypoint"] = any(token in name.lower() for token in self._ENTRYPOINT_HINTS)
             metadata["auth_guard"] = any(token in name.lower() for token in self._AUTH_GUARD_HINTS)
             _mark_function_entrypoint(self.nodes[nid], name, metadata)
-            self.edges.append(self._edge(module_id, nid, EdgeRelation.IMPORTS))
+            self.edges.append(self._edge(module_id, nid, EdgeRelation.CONTAINS))
             declared.add(name)
             fn_ranges.append((start_line, end_line, nid))
         for lineno, line in enumerate(source.splitlines(), 1):
@@ -401,7 +539,7 @@ class GoParser(TreeSitterParser):
             self.nodes[nid] = self._make_node(nid, NodeType.FUNCTION, name, path, start_line)
             self.nodes[nid].metadata["framework"] = "gin" if "gin." in source[max(0, match.start() - 160):match.start()].lower() else ""
             _mark_function_entrypoint(self.nodes[nid], name)
-            self.edges.append(self._edge(module_id, nid, EdgeRelation.IMPORTS))
+            self.edges.append(self._edge(module_id, nid, EdgeRelation.CONTAINS))
             declared.add(name)
             fn_ranges.append((start_line, end_line, nid))
         for lineno, line in enumerate(source.splitlines(), 1):
@@ -446,7 +584,7 @@ class _RegexLanguageParser(LanguageParser):
                 self.nodes[nid].metadata["entrypoint"] = True
             if "@restcontroller" in context_window or "@controller" in context_window:
                 self.nodes[nid].metadata["framework"] = "spring"
-            self.edges.append(self._edge(module_id, nid, EdgeRelation.IMPORTS))
+            self.edges.append(self._edge(module_id, nid, EdgeRelation.CONTAINS))
             declared.add(name)
             fn_ranges.append((start_line, end_line, nid))
         for lineno, line in enumerate(source.splitlines(), 1):

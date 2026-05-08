@@ -9,8 +9,10 @@ from typing import List, Optional, Set
 
 from config import SUPPORTED_PROFILES, load_finding_profile, load_ruleset
 from core.runtime import CVEEnricher, MultiFileParser, changed_files_between_commits
+from evaluation import evaluate_graph_queries, load_evaluation_cases
 from feedback import FeedbackEntry, apply_feedback_scores, feedback_stats, load_feedback_db, record_feedback, tune_rules
-from models import AnalysisOptions, FindingProfile, SecurityConfig, TaintConfig
+from graph_queries import GraphQueryEngine, render_query_text
+from models import AnalysisOptions, FindingProfile, SecurityConfig, TaintConfig, formal_ir_spec
 from plugins.loader import load_plugin_modules
 from reports import (
     GraphSnapshot,
@@ -119,6 +121,18 @@ def _build_cli() -> argparse.ArgumentParser:
     diff_parser.add_argument("snap_a")
     diff_parser.add_argument("snap_b")
 
+    query_parser = sub.add_parser("query", help="Run deterministic graph query DSL")
+    query_parser.add_argument("--expr", required=True, help='Query expression, e.g. "path source=request target=eval relations=dataflow,calls"')
+    query_parser.add_argument("--snapshot", help="Read graph from GraphSnapshot JSON instead of parsing root")
+    query_parser.add_argument("--format", choices=["json", "text"], default="json")
+    query_parser.add_argument("--out", help="Write query result to file instead of stdout")
+
+    eval_parser = sub.add_parser("evaluate", help="Evaluate deterministic graph queries against gold cases")
+    eval_parser.add_argument("--cases", required=True, help="Evaluation cases JSON")
+    eval_parser.add_argument("--snapshot", help="Read graph from GraphSnapshot JSON instead of parsing root")
+    eval_parser.add_argument("--out", help="Write evaluation report JSON to file instead of stdout")
+
+    sub.add_parser("ir-spec", help="Emit formal machine-readable IR specification")
     sub.add_parser("init-project", help="Emit pyproject.toml skeleton")
     sub.add_parser("info", help="Show parser backend configuration")
     sub.add_parser("self-test", help="Run embedded unit tests")
@@ -162,6 +176,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             cli.error("--feedback-db is required for feedback-tune")
         print(json.dumps(tune_rules(load_feedback_db(args.feedback_db)), indent=2))
         return 0
+    if args.command == "ir-spec":
+        print(json.dumps(formal_ir_spec(), indent=2))
+        return 0
     if args.command == "init-project":
         from pathlib import Path
 
@@ -176,7 +193,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  Active profile       : {profile_def.name}")
         return 0
 
-    if not args.root and args.command not in ["diff"]:
+    no_root_commands = {"diff", "ir-spec"}
+    if not args.root and args.command not in no_root_commands and not getattr(args, "snapshot", None):
         cli.print_help()
         return 1
 
@@ -203,6 +221,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     excludes = [p.strip() for p in args.exclude.split(",")] if args.exclude else None
     parser = MultiFileParser(args.root, security_config=sec_cfg, exclude_patterns=excludes, options=options, use_cache=not args.no_cache) if args.root else None
+
+    def _graph_for_command() -> dict:
+        if getattr(args, "snapshot", None):
+            snap = GraphSnapshot.load(args.snapshot)
+            return snap.full_graph
+        parser.parse_all()
+        return parser.get_graph()
 
     if args.command in {"scan", "bounty-report", "ci-scan", "submit-report", "poc", "web-ui"}:
         cve_enricher = CVEEnricher.from_feed(args.cve_feed) if getattr(args, "cve_feed", None) else None
@@ -264,6 +289,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = parser.scan(taint_config=taint_cfg)
         bounty = build_bounty_report(report, profile=profile_def, quick_mode=args.quick_mode)
         output = render_bounty_output(bounty, args.format)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(output)
+        else:
+            print(output)
+        return 0
+
+    if args.command == "query":
+        graph = _graph_for_command()
+        result = GraphQueryEngine(graph).execute(args.expr)
+        output = json.dumps(result, indent=2) if args.format == "json" else render_query_text(result)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(output)
+        else:
+            print(output)
+        return 0
+
+    if args.command == "evaluate":
+        graph = _graph_for_command()
+        report = evaluate_graph_queries(graph, load_evaluation_cases(args.cases))
+        output = report.to_json()
         if args.out:
             with open(args.out, "w", encoding="utf-8") as handle:
                 handle.write(output)

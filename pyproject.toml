@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rootai-semantic-parser"
-version = "0.20.0"
+version = "0.21.0"
 description = "Polyglot semantic parser with taint analysis and finding-profile policy."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,8 @@ authors = [
   { name = "RootAI" }
 ]
 dependencies = [
+  "fastapi>=0.115,<1",
+  "streamlit>=1.44,<2",
   "pydantic>=2.8,<3",
   "tqdm>=4.66,<5",
   "tree-sitter>=0.24,<0.26",
@@ -30,13 +32,38 @@ dev = [
 
 [project.scripts]
 semantic-parser = "rootai_semantic_parser.cli:main"
+rootai-semantic-parser = "rootai_semantic_parser.cli:main"
+rootai = "rootai_semantic_parser.cli:main"
 
 [tool.setuptools]
 include-package-data = true
+py-modules = [
+  "app",
+  "async_parse",
+  "benchmark",
+  "api",
+  "cli",
+  "config",
+  "evaluation",
+  "feedback",
+  "graph_queries",
+  "legacy_impl",
+  "metrics",
+  "models",
+  "version",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rootai_semantic_parser*"]
+include = [
+  "rootai_semantic_parser*",
+  "analyzers*",
+  "core*",
+  "parsers*",
+  "plugins*",
+  "reports*",
+]
+exclude = ["tests*", "docs*"]
 
 [tool.pytest.ini_options]
 testpaths = [

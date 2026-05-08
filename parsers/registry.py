@@ -1,4 +1,4 @@
-"""Small plugin registry for parser extensions."""
+﻿"""Small plugin registry for parser extensions."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ def register_parser(parser_cls: Type[object]) -> None:
 
 def iter_parser_classes() -> Iterable[Type[object]]:
     """Yield built-in and plugin parser classes in registration order."""
-    from engines import CSharpParser, GoParser, JavaParser, JavaScriptParser, PHPParser, PythonParser, RubyParser
+    # Prefixing with 'parsers.' so the RootAI core can find it from the root
+    from parsers.engines import CSharpParser, GoParser, JavaParser, JavaScriptParser, PHPParser, PythonParser, RubyParser
 
     builtins: List[Type[object]] = [
         PythonParser,

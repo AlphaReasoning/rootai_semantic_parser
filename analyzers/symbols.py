@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+import os
 from typing import Dict, List, Optional, Tuple
 
-from models import EdgeRelation
+from models import EdgeRelation, NodeType
 
 
 class SSAVersionTracker:
@@ -37,6 +38,7 @@ class GlobalSymbolTable:
         self.qualified_index: Dict[str, List[str]] = defaultdict(list)
         self.file_scoped_index: Dict[Tuple[str, str], List[str]] = defaultdict(list)
         self.origin_scoped_index: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        self.import_aliases: Dict[Tuple[str, str], Dict] = {}
 
     def build(self, graph: Dict) -> None:
         """Build indexes from a graph."""
@@ -44,11 +46,16 @@ class GlobalSymbolTable:
         self.qualified_index.clear()
         self.file_scoped_index.clear()
         self.origin_scoped_index.clear()
+        self.import_aliases.clear()
         for node in graph.get("nodes", []):
             name = node.get("label")
             if not name:
                 continue
             nid = node["id"]
+            if node.get("type") == NodeType.IMPORT.value:
+                origin_key = self._origin_key(node)
+                if origin_key:
+                    self.import_aliases[(origin_key, name)] = node.get("metadata", {})
             if nid not in self.index[name]:
                 self.index[name].append(nid)
             qualified_name = node.get("qualified_name")
@@ -116,6 +123,70 @@ class GlobalSymbolTable:
             return matches[0]
         return None
 
+    def resolve_imported(
+        self,
+        name: str,
+        file_scope: Optional[str] = None,
+        source_node: Optional[Dict] = None,
+    ) -> Optional[str]:
+        """Resolve a symbol through static import aliases from the source scope."""
+        source_node = source_node or {}
+        source_origin = self._origin_key(source_node, fallback=file_scope or "")
+        if not self._has_stable_origin(source_node, fallback=file_scope or ""):
+            return None
+        parts = [part for part in name.split(".") if part]
+        if not parts:
+            return None
+        alias = parts[0]
+        import_meta = self.import_aliases.get((source_origin, alias))
+        if not import_meta:
+            return None
+        module_hint = str(import_meta.get("import_module") or "")
+        imported_name = import_meta.get("import_name")
+        if imported_name:
+            target_name = ".".join([str(imported_name)] + parts[1:])
+        elif len(parts) > 1:
+            target_name = parts[-1]
+        else:
+            target_name = os.path.basename(module_hint.rstrip(".")).split(".")[0]
+        return self.resolve_in_module(target_name, module_hint)
+
+    def resolve_in_module(self, name: str, module_hint: str) -> Optional[str]:
+        """Resolve a symbol by label and imported module/file hint."""
+        simple_name = name.rsplit(".", 1)[-1]
+        candidates = self.index.get(simple_name, [])
+        if not candidates:
+            return None
+        module_matches = [nid for nid in candidates if self._module_matches(self._node_file(nid), module_hint)]
+        if len(module_matches) == 1:
+            return module_matches[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _node_file(self, node_id: str) -> str:
+        for key, ids in self.file_scoped_index.items():
+            if node_id in ids:
+                return key[0]
+        for key, ids in self.origin_scoped_index.items():
+            if node_id in ids:
+                return key[0]
+        return ""
+
+    @staticmethod
+    def _module_matches(file_path: str, module_hint: str) -> bool:
+        if not file_path or not module_hint:
+            return False
+        module_parts = [part for part in module_hint.lstrip(".").split(".") if part]
+        if not module_parts:
+            return False
+        normalized = file_path.replace("\\", "/")
+        stem = os.path.splitext(os.path.basename(normalized))[0]
+        if stem == module_parts[-1]:
+            return True
+        suffix = "/".join(module_parts)
+        return normalized.endswith(f"/{suffix}.py") or normalized.endswith(f"/{suffix}/__init__.py")
+
 
 class SymbolResolver:
     """Resolve synthetic call targets to known symbols."""
@@ -126,36 +197,59 @@ class SymbolResolver:
         self.node_index = {n["id"]: n for n in graph.get("nodes", [])}
 
     def run(self) -> Dict:
-        """Resolve call edges in-place and return the graph."""
+        """Resolve static symbol endpoints in-place and return the graph."""
         self.symbols.build(self.graph)
         resolved_count = 0
         unresolved_count = 0
         resolved_edges: List[Dict] = []
 
         for edge in self.graph.get("edges", []):
-            if edge["relation"] != EdgeRelation.CALLS.value:
-                resolved_edges.append(edge)
-                continue
-            target_id = edge["target"]
-            if target_id in self.node_index:
+            if edge["relation"] not in {
+                EdgeRelation.CALLS.value,
+                EdgeRelation.DATAFLOW.value,
+                EdgeRelation.RETURNS.value,
+                EdgeRelation.INHERITS.value,
+            }:
                 resolved_edges.append(edge)
                 continue
 
             source_node = self.node_index.get(edge["source"], {})
             source_scope = source_node.get("file")
-            resolved_id = self.symbols.resolve(
-                target_id,
-                file_scope=source_scope,
-                source_node=source_node,
-            )
             edge = dict(edge)
-            if resolved_id:
-                edge["target"] = resolved_id
+            endpoint_resolved = False
+
+            resolved_source = self._resolve_endpoint(edge["source"], source_node, source_scope)
+            if resolved_source and resolved_source != edge["source"]:
+                edge["source"] = resolved_source
+                edge.setdefault("metadata", {})["resolved_source"] = True
+                endpoint_resolved = True
+
+            source_node = self.node_index.get(edge["source"], source_node)
+            source_scope = source_node.get("file") or source_scope
+            resolved_target = self._resolve_endpoint(edge["target"], source_node, source_scope)
+            if resolved_target and resolved_target != edge["target"]:
+                edge["target"] = resolved_target
+                edge.setdefault("metadata", {})["resolved_target"] = True
+                endpoint_resolved = True
+
+            if endpoint_resolved:
                 edge.setdefault("metadata", {})["resolved"] = True
                 resolved_count += 1
-            else:
+            elif self._should_count_unresolved(edge["target"]):
                 edge.setdefault("metadata", {})["unresolved"] = True
                 unresolved_count += 1
+            else:
+                target_id = edge["target"]
+                if target_id not in self.node_index:
+                    resolved_id = self.symbols.resolve(
+                        target_id,
+                        file_scope=source_scope,
+                        source_node=source_node,
+                    )
+                    if resolved_id:
+                        edge["target"] = resolved_id
+                        edge.setdefault("metadata", {})["resolved"] = True
+                        resolved_count += 1
             resolved_edges.append(edge)
 
         self.graph["edges"] = resolved_edges
@@ -164,6 +258,33 @@ class SymbolResolver:
             "unresolved": unresolved_count,
         }
         return self.graph
+
+    def _resolve_endpoint(self, endpoint_id: str, source_node: Dict, source_scope: Optional[str]) -> Optional[str]:
+        endpoint_node = self.node_index.get(endpoint_id)
+        if endpoint_node:
+            metadata = endpoint_node.get("metadata", {})
+            if endpoint_node.get("type") == NodeType.IMPORT.value:
+                symbol = str(metadata.get("import_alias") or endpoint_node.get("label") or "")
+                return self.symbols.resolve_imported(symbol, file_scope=source_scope, source_node=endpoint_node)
+            if metadata.get("synthetic") == "call_target":
+                symbol = str(metadata.get("call_name") or endpoint_node.get("label") or "")
+                return (
+                    self.symbols.resolve_imported(symbol, file_scope=source_scope, source_node=source_node)
+                    or self.symbols.resolve(symbol, file_scope=source_scope, source_node=source_node)
+                )
+            return None
+        return self.symbols.resolve_imported(endpoint_id, file_scope=source_scope, source_node=source_node) or self.symbols.resolve(
+            endpoint_id,
+            file_scope=source_scope,
+            source_node=source_node,
+        )
+
+    def _should_count_unresolved(self, endpoint_id: str) -> bool:
+        endpoint_node = self.node_index.get(endpoint_id)
+        if not endpoint_node:
+            return True
+        metadata = endpoint_node.get("metadata", {})
+        return endpoint_node.get("type") == NodeType.IMPORT.value or metadata.get("synthetic") == "call_target"
 
 
 def make_node_id(file_path: str, name: str) -> str:

@@ -291,11 +291,23 @@ def finding_fingerprint(finding: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _split_location(value: str) -> tuple[str, int]:
+    """Split a `path[:line]` location into artifact path and line number."""
+    text = str(value or "").strip()
+    if not text:
+        return "", 1
+    path_part, sep, maybe_line = text.rpartition(":")
+    if sep and maybe_line.isdigit():
+        return path_part, max(int(maybe_line), 1)
+    return text, 1
+
+
 def bounty_report_to_sarif(bounty: BountyReport) -> str:
     """Render SARIF output for AppSec tooling."""
     results = []
     for finding in bounty.findings:
         rule_id = finding.get("impact", "generic").replace(" ", "_").lower()
+        artifact_uri, start_line = _split_location(str(finding.get("sink_location", "")))
         results.append(
             {
                 "ruleId": rule_id,
@@ -304,8 +316,8 @@ def bounty_report_to_sarif(bounty: BountyReport) -> str:
                 "locations": [
                     {
                         "physicalLocation": {
-                            "artifactLocation": {"uri": str(finding.get("sink_location", "")).split(":")[0]},
-                            "region": {"startLine": int(str(finding.get("sink_location", "0:0")).split(":")[-1] or 1)},
+                            "artifactLocation": {"uri": artifact_uri},
+                            "region": {"startLine": start_line},
                         }
                     }
                 ],
@@ -324,13 +336,14 @@ def bounty_report_to_annotations(bounty: BountyReport, provider: str) -> str:
     """Render simple annotation payloads for CI providers."""
     items = []
     for finding in bounty.findings:
+        artifact_uri, _ = _split_location(str(finding.get("sink_location", "")))
         items.append(
             {
                 "provider": provider,
                 "fingerprint": finding_fingerprint(finding),
                 "severity": finding.get("severity"),
                 "message": f"{finding.get('potential_impact', finding.get('impact'))}: {finding.get('explanation', ' -> '.join(finding.get('path_labels', [])))}",
-                "path": str(finding.get("sink_location", "")).split(":")[0],
+                "path": artifact_uri,
                 "location": finding.get("sink_location"),
             }
         )
