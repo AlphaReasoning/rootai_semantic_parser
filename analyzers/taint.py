@@ -510,6 +510,7 @@ class TaintAnalyzer:
                     )
                 )
 
+        self.taint_paths = self._collapse_nested_sinks(self.taint_paths)
         self.taint_paths = [
             item for item in self.taint_paths
             if item.score >= self.options.min_score
@@ -517,6 +518,26 @@ class TaintAnalyzer:
         ]
         self.taint_paths.sort(key=lambda item: item.score, reverse=True)
         return self.taint_paths
+
+    @staticmethod
+    def _collapse_nested_sinks(paths: List[TaintPath]) -> List[TaintPath]:
+        """Report one finding per source reaching one place in the code.
+
+        ``eval(compile(f.read(), ...))`` nests two sinks on a single line, and
+        reporting both makes one issue look like two. The highest-scoring path
+        wins; ties break on the sink label so the choice is reproducible.
+        """
+        best: Dict[Tuple[str, str], TaintPath] = {}
+        for path in paths:
+            key = (path.source_label, path.sink_location)
+            current = best.get(key)
+            if (
+                current is None
+                or path.score > current.score
+                or (path.score == current.score and path.sink_label < current.sink_label)
+            ):
+                best[key] = path
+        return list(best.values())
 
     def _reconstruct(self, sink_state: Tuple[str, FrozenSet[str]]) -> List[str]:
         path: List[str] = []

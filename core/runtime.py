@@ -399,6 +399,40 @@ class ParseCache:
 
 _DEFAULT_EXCLUDES = frozenset({"node_modules", ".git", "__pycache__", "vendor", "dist", "build", ".venv", "venv", "target"})
 
+#: Files above this size are treated as generated. Bundled assets reach several
+#: megabytes on one line and take minutes to parse for no analytical value.
+_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+#: A source file written by a person wraps its lines. Anything past this is
+#: minified or generated, and parsing it costs far more than it returns.
+_MAX_LINE_BYTES = 8_000
+
+
+def looks_generated(path: str) -> Optional[str]:
+    """Return why a file looks machine-generated, or None if it looks human.
+
+    Bundled and minified assets are the practical blocker to scanning real
+    repositories: a single 4.5 MB bundle with 600,000-character lines takes
+    longer to parse than the entire rest of a project.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size > _MAX_FILE_BYTES:
+        return f"larger than {_MAX_FILE_BYTES // (1024 * 1024)}MB"
+    if size < _MAX_LINE_BYTES:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(256 * 1024)
+    except OSError:
+        return None
+    longest = max((len(part) for part in head.split(b"\n")), default=0)
+    if longest > _MAX_LINE_BYTES:
+        return f"line longer than {_MAX_LINE_BYTES} bytes (minified)"
+    return None
+
 
 class MultiFileParser:
     """Repository parser orchestration."""
@@ -421,6 +455,7 @@ class MultiFileParser:
         self._parsed = False
         self._cache = ParseCache(__version__, self.options, self.config) if use_cache else None
         self._event_callback = event_callback
+        self.skipped_files: List[Tuple[str, str]] = []
 
     def _emit(self, stage: str, message: str, **payload: Any) -> None:
         if not self._event_callback:
@@ -454,6 +489,8 @@ class MultiFileParser:
             ]
             self._emit("discover", "Quick mode filtered test and fixture files.", filtered_file_count=len(files_to_parse))
 
+        skipped: List[Tuple[str, str]] = []
+
         def _parse_file(fpath: str):
             if self._cache:
                 cached = self._cache.load(fpath)
@@ -461,6 +498,10 @@ class MultiFileParser:
                     return cached
             for cls in self._parser_classes:
                 if cls.supports(fpath):
+                    reason = looks_generated(fpath)
+                    if reason:
+                        skipped.append((fpath, reason))
+                        return None
                     parser = cls(self.config, options=self.options)
                     parser.parse(fpath)
                     if self._cache:
@@ -487,6 +528,16 @@ class MultiFileParser:
                         candidate_file_count=len(files_to_parse),
                         parser_count=len(self._parsers),
                     )
+        if skipped:
+            # Reported rather than dropped quietly: a silently skipped file reads
+            # as "covered" when it was not.
+            self._emit(
+                "parse",
+                "Skipped generated or minified files.",
+                skipped_count=len(skipped),
+                skipped=[{"file": f, "reason": r} for f, r in skipped[:20]],
+            )
+            self.skipped_files = list(skipped)
         self._emit("parse", "Parsing complete.", parsed_count=parsed_count, parser_count=len(self._parsers))
 
     def parse_changed_files(self, changed_files: List[str]) -> None:

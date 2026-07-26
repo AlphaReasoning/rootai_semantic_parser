@@ -38,6 +38,10 @@ class GlobalSymbolTable:
         self.qualified_index: Dict[str, List[str]] = defaultdict(list)
         self.file_scoped_index: Dict[Tuple[str, str], List[str]] = defaultdict(list)
         self.origin_scoped_index: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        # node id -> declaring file. Built alongside the scoped indexes because
+        # deriving it by scanning them on each lookup made resolution quadratic
+        # in graph size: 100 source files spent 33 of 43 seconds in _node_file.
+        self.node_file_index: Dict[str, str] = {}
         self.import_aliases: Dict[Tuple[str, str], Dict] = {}
 
     def build(self, graph: Dict) -> None:
@@ -56,6 +60,7 @@ class GlobalSymbolTable:
         self.qualified_index.clear()
         self.file_scoped_index.clear()
         self.origin_scoped_index.clear()
+        self.node_file_index.clear()
         self.import_aliases.clear()
         self.short_name_index: Dict[str, List[str]] = defaultdict(list)  # Fix 2
         for node in graph.get("nodes", []):
@@ -86,9 +91,12 @@ class GlobalSymbolTable:
                 scoped_key = (self._origin_key(node, fallback=file_scope), name)
                 if nid not in self.file_scoped_index[scoped_key]:
                     self.file_scoped_index[scoped_key].append(nid)
+                self.node_file_index.setdefault(nid, scoped_key[0])
             origin_key = self._origin_key(node)
             if origin_key and nid not in self.origin_scoped_index[(origin_key, name)]:
                 self.origin_scoped_index[(origin_key, name)].append(nid)
+            if origin_key:
+                self.node_file_index.setdefault(nid, origin_key)
 
     @staticmethod
     def _origin_key(node: Dict, fallback: str = "") -> str:
@@ -193,13 +201,13 @@ class GlobalSymbolTable:
         return None
 
     def _node_file(self, node_id: str) -> str:
-        for key, ids in self.file_scoped_index.items():
-            if node_id in ids:
-                return key[0]
-        for key, ids in self.origin_scoped_index.items():
-            if node_id in ids:
-                return key[0]
-        return ""
+        """Return the file a node was declared in.
+
+        Answered from a reverse index built during ``build()``. Scanning the
+        scoped indexes here instead made symbol resolution quadratic in graph
+        size, which put any repository of a few hundred files out of reach.
+        """
+        return self.node_file_index.get(node_id, "")
 
     @staticmethod
     def _module_matches(file_path: str, module_hint: str) -> bool:
