@@ -154,6 +154,9 @@ class GenericTreeSitterParser(TreeSitterParser):
         # declared below its first use.
         self._call_sites: List[Tuple[str, str, List[str]]] = []
         self._pending_function_name: Optional[str] = None
+        #: Built once. to_taint_config() constructs fresh sets, and it was being
+        #: called for every binding and every call in the file.
+        self._taint_config = config.to_taint_config()
         # Routes registered by name before the handler is declared.
         self._route_handlers_by_name: Dict[str, List[Tuple[str, str, str]]] = {}
         #: (start_byte, end_byte) of an inline handler -> the route it serves.
@@ -289,7 +292,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         if not value_text:
             return
 
-        taint_config = self.config.to_taint_config()
+        taint_config = self._taint_config
         is_source = self._matches_pattern(value_text, taint_config.sources)
 
         bound_functions = [
@@ -373,7 +376,7 @@ class GenericTreeSitterParser(TreeSitterParser):
             return None
 
         resolved = self._resolve_alias(callee_text)
-        taint_config = self.config.to_taint_config()
+        taint_config = self._taint_config
         is_source = self._matches_pattern(callee_text, taint_config.sources) or self._matches_pattern(
             resolved, taint_config.sources
         )
