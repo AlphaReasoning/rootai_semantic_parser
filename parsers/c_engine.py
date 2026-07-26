@@ -734,6 +734,11 @@ class CParser(TreeSitterParser):
                 "is_conditional": is_conditional,
                 "defined_in_header": path if self._is_header else None,
                 "is_unsafe_expansion": is_unsafe_expansion,
+                # A function-like macro wrapping a dangerous call *is* that call
+                # at every use site, but its own name carries no evidence of it
+                # (UNSAFE_FMT gives no hint of sprintf). Recorded explicitly so
+                # taint analysis treats the macro as the sink it expands to.
+                "is_taint_sink": is_unsafe_expansion,
             }
         )
         if is_unsafe_expansion:
@@ -1053,6 +1058,54 @@ class CParser(TreeSitterParser):
                     )
                 )
 
+            # Visit the initialiser. A call in this position was previously never
+            # visited at all, so `ssize_t n = read(fd, buf, len);` produced no
+            # CALLS edge and never marked its output buffer as tainted -- the
+            # declaration form alone hid the call.
+            initialiser = self._declarator_initialiser(decl_child)
+            if initialiser is not None:
+                self._visit_expr(initialiser, src, path, parent_id)
+                for call_node in self._iter_call_expressions(initialiser):
+                    self.edges.append(
+                        self._edge(
+                            self._make_id(
+                                path,
+                                f"__call_target__{self._call_target_name(call_node, src)}",
+                            ),
+                            var_id,
+                            EdgeRelation.DATAFLOW,
+                            {"flow_kind": "call_return", "ssa_label": ssa_label},
+                        )
+                    )
+
+    @staticmethod
+    def _declarator_initialiser(decl_child):
+        """Return the value node of an ``init_declarator``, or None."""
+        if decl_child is None or decl_child.type != _TS_INIT_DECLARATOR:
+            return None
+        seen_equals = False
+        for child in decl_child.children:
+            if child.type == "=":
+                seen_equals = True
+                continue
+            if seen_equals:
+                return child
+        return None
+
+    @staticmethod
+    def _iter_call_expressions(node):
+        """Yield the outermost call expressions inside ``node``."""
+        if node.type == _TS_CALL_EXPR:
+            yield node
+            return
+        for child in node.children:
+            yield from CParser._iter_call_expressions(child)
+
+    @staticmethod
+    def _call_target_name(call_node, src: str) -> str:
+        function = call_node.children[0] if call_node.children else None
+        return CParser._get_text(src, function) if function is not None else ""
+
     # ------------------------------------------------------------------
     # Expression visitor
     # ------------------------------------------------------------------
@@ -1130,6 +1183,12 @@ class CParser(TreeSitterParser):
         callee = self._get_text(src, fn_node_ts)
         lineno = node.start_point[0] + 1
 
+        # A function-like macro is the call it expands to. Its own name carries
+        # no evidence of that (UNSAFE_FMT gives no hint of sprintf), so the sink
+        # determination is made here and recorded, rather than left to a label
+        # match that cannot succeed.
+        expands_to_sink = self._macro_expands_to_sink(callee)
+
         callee_id = self._make_id(path, f"__call_target__{callee}")
         if callee_id not in self.nodes:
             ct_node = self._make_node(callee_id, NodeType.FUNCTION, callee, path, lineno)
@@ -1138,9 +1197,13 @@ class CParser(TreeSitterParser):
                     "language": "c",
                     "synthetic": True,
                     "is_format_string_sink": callee in _FORMAT_STRING_SINKS,
+                    "is_taint_sink": expands_to_sink,
+                    "expands_to": self._macro_registry.get(callee, {}).get("body_text", "")[:128]
+                    if expands_to_sink
+                    else "",
                 }
             )
-            if callee in _UNSAFE_C_SINKS:
+            if callee in _UNSAFE_C_SINKS or expands_to_sink:
                 ct_node.is_unsafe = True
             self.nodes[callee_id] = ct_node
 
@@ -1177,6 +1240,14 @@ class CParser(TreeSitterParser):
     # ------------------------------------------------------------------
     # Call-argument value modelling
     # ------------------------------------------------------------------
+
+    def _macro_expands_to_sink(self, callee: str) -> bool:
+        """Return whether ``callee`` is a macro whose body invokes a known sink."""
+        macro = self._macro_registry.get(callee)
+        if not macro:
+            return False
+        tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", macro.get("body_text", "")))
+        return bool(tokens & (_UNSAFE_C_SINKS | _FORMAT_STRING_SINKS))
 
     @staticmethod
     def _call_argument_nodes(node, _src: str) -> List[Tuple[int, Any]]:
@@ -1221,12 +1292,18 @@ class CParser(TreeSitterParser):
         if not normalized or normalized.isdigit():
             return None
 
-        key = (fn_id, normalized)
+        # A member expression designates storage that outlives the function
+        # reading it: one function may fill `ctx->recv_buf` and another consume
+        # it, so those uses must resolve to the same node. Bare locals stay
+        # function-scoped, since two functions' `buf` are unrelated.
+        scope = "" if ("->" in normalized or "." in normalized) else fn_id
+
+        key = (scope, normalized)
         existing = self._value_nodes.get(key)
         if existing is not None:
             return existing
 
-        value_id = self._make_id(path, f"{fn_id}::value::{normalized}")
+        value_id = self._make_id(path, f"{scope}::value::{normalized}")
         if value_id not in self.nodes:
             value_node = self._make_node(
                 value_id, NodeType.DATA, normalized, path, arg_node.start_point[0] + 1
@@ -1285,17 +1362,13 @@ class CParser(TreeSitterParser):
             value_id = resolved.get(index)
             if value_id is None:
                 continue
+            # Marked rather than linked. An edge callee -> buffer would turn the
+            # shared synthetic call-target stub into a conduit between every call
+            # site of that function, so one caller's buffer would appear to taint
+            # an unrelated caller's.
             self.nodes[value_id].is_unsafe = True
             self.nodes[value_id].metadata["is_taint_source"] = True
             self.nodes[value_id].metadata["tainted_by"] = callee
-            self.edges.append(
-                self._edge(
-                    callee_id,
-                    value_id,
-                    EdgeRelation.DATAFLOW,
-                    {"flow_kind": "call_output", "arg_index": index, "call_name": callee},
-                )
-            )
 
         # Copy-style calls move taint from their source arguments to their
         # destination, without asserting that anything is tainted.

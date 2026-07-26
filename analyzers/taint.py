@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import heapq
+import re
 from collections import defaultdict
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from models import AnalysisOptions, EdgeRelation, TaintConfig, TaintPath
+
+#: Anything that is not part of an identifier separates one name from the next,
+#: so ``os.system(cmd)``, ``ctx->recv_buf`` and ``Command::new(&x)`` all reduce to
+#: their component names.
+_SEGMENT_SPLIT = re.compile(r"[^0-9A-Za-z_]+")
+
+#: SSA versioning suffix appended by the parsers (``user_input_v2``).
+_SSA_SUFFIX = re.compile(r"_v\d+$")
 
 
 class TaintAnalyzer:
@@ -47,6 +56,7 @@ class TaintAnalyzer:
         self.tainted_nodes: Set[str] = set()
         self.taint_paths: List[TaintPath] = []
         self._node_idx: Dict[str, Dict] = {n["id"]: n for n in graph.get("nodes", [])}
+        self._segment_cache: Dict[Any, Tuple[str, ...]] = {}
         self._adj: Dict[str, List[Tuple[str, str, float]]] = defaultdict(list)
         for edge in graph.get("edges", []):
             for source, target, relation, weight in self._propagations(edge):
@@ -105,9 +115,59 @@ class TaintAnalyzer:
 
         return []
 
+    @staticmethod
+    def _segments(text: str) -> Tuple[str, ...]:
+        """Split an expression into the identifier names it is built from.
+
+        ``os.system(cmd)`` becomes ``('os', 'system', 'cmd')`` and
+        ``ctx->recv_buf`` becomes ``('ctx', 'recv_buf')``. SSA suffixes are
+        removed so a pattern written for ``user_input`` still matches the
+        parser's ``user_input_v2``.
+        """
+        segments: List[str] = []
+        for raw in _SEGMENT_SPLIT.split(text.lower()):
+            if not raw:
+                continue
+            segments.append(_SSA_SUFFIX.sub("", raw) or raw)
+        return tuple(segments)
+
+    def _node_segments(self, node: Dict) -> Tuple[str, ...]:
+        node_id = node.get("id")
+        cached = self._segment_cache.get(node_id)
+        if cached is None:
+            cached = self._segments(node.get("label", ""))
+            self._segment_cache[node_id] = cached
+        return cached
+
+    @classmethod
+    def _pattern_matches(cls, label_segments: Tuple[str, ...], pattern: str) -> bool:
+        """Match a configured pattern against an expression's identifier names.
+
+        Matching is segment-aligned rather than a raw substring test. Plain
+        containment made ``exec`` match ``execute``, ``eval`` match
+        ``EvaluationCase`` and ``read`` match any function whose name merely
+        contained those letters, which was the dominant source of false
+        positives. A single-name pattern must equal a whole segment; a dotted or
+        scoped pattern must appear as a consecutive run of segments, so
+        ``os.system`` matches ``os.system(cmd)`` but not an unrelated ``system``
+        attribute of another object.
+        """
+        pattern_segments = cls._segments(pattern)
+        if not pattern_segments:
+            return False
+        if len(pattern_segments) == 1:
+            return pattern_segments[0] in label_segments
+        span = len(pattern_segments)
+        return any(
+            label_segments[index : index + span] == pattern_segments
+            for index in range(len(label_segments) - span + 1)
+        )
+
     def _matches(self, node: Dict, keyword_set: Set[str]) -> bool:
-        label = node.get("label", "").lower()
-        return any(kw.lower() in label for kw in keyword_set)
+        label_segments = self._node_segments(node)
+        if not label_segments:
+            return False
+        return any(self._pattern_matches(label_segments, kw) for kw in keyword_set)
 
     def _is_taint_source(self, node: Dict) -> bool:
         """Return whether a node introduces externally controlled data.

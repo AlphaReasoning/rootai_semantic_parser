@@ -141,6 +141,62 @@ def test_node_matching_source_and_sink_is_not_a_finding() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pattern matching
+# ---------------------------------------------------------------------------
+
+
+def _match(label: str, pattern: str) -> bool:
+    return TaintAnalyzer._pattern_matches(TaintAnalyzer._segments(label), pattern)
+
+
+def test_segments_split_an_expression_into_identifier_names() -> None:
+    assert TaintAnalyzer._segments("os.system(cmd)") == ("os", "system", "cmd")
+    assert TaintAnalyzer._segments("ctx->recv_buf") == ("ctx", "recv_buf")
+    assert TaintAnalyzer._segments("Command::new(&value)") == ("command", "new", "value")
+
+
+def test_ssa_suffixes_are_stripped_before_matching() -> None:
+    """Parsers version bindings, so a pattern must still match user_input_v2."""
+    assert TaintAnalyzer._segments("user_input_v12") == ("user_input",)
+    assert _match("user_input_v2", "user_input")
+
+
+def test_single_name_pattern_requires_a_whole_segment() -> None:
+    """Regression: plain substring containment was the dominant FP source."""
+    assert _match("eval(payload)", "eval")
+    assert not _match("EvaluationCase", "eval")
+    assert not _match("evaluate_graph_queries", "eval")
+    assert not _match("load_evaluation_cases", "eval")
+
+    assert _match("exec(code)", "exec")
+    assert not _match("cursor.execute", "exec")
+    assert not _match("GraphQueryEngine.execute", "exec")
+    assert not _match("_render_execute_step", "exec")
+
+    assert _match("read(fd, buf, n)", "read")
+    assert not _match("test_multibyte_literals_are_read_intact", "read")
+
+    assert _match("system(cmd)", "system")
+    assert not _match("reaching_system_v1", "system")
+
+
+def test_dotted_pattern_matches_a_consecutive_run_of_segments() -> None:
+    assert _match("os.system(cmd)", "os.system")
+    assert _match("result = os.system(cmd)", "os.system")
+    assert not _match("os.path.join(a, b)", "os.system")
+    assert not _match("system.os", "os.system")
+
+
+def test_scoped_pattern_matches_rust_and_c_forms() -> None:
+    assert _match("std::mem::transmute(x)", "std::mem::transmute")
+    assert not _match("mem::transmute_copy", "std::mem::transmute")
+
+
+def test_matching_is_case_insensitive() -> None:
+    assert _match("OS.System(cmd)", "os.system")
+
+
+# ---------------------------------------------------------------------------
 # Relation policy
 # ---------------------------------------------------------------------------
 
@@ -274,6 +330,58 @@ def test_analysis_of_one_graph_is_reproducible() -> None:
 
     runs = [[p.explanation for p in _run(nodes, edges)] for _ in range(5)]
     assert all(result == runs[0] for result in runs), runs
+
+
+def test_c_macro_expanding_to_a_sink_is_treated_as_that_sink() -> None:
+    """UNSAFE_FMT's own name carries no evidence that it reaches sprintf."""
+    paths = _scan(
+        {
+            "src/m.c": "#define UNSAFE_FMT(buf, fmt) sprintf((buf), (fmt))\n"
+            "void handle(int fd) {\n"
+            "    char log_buf[512];\n"
+            "    char data[256];\n"
+            "    read(fd, data, 256);\n"
+            "    UNSAFE_FMT(log_buf, data);\n"
+            "}\n"
+        }
+    )
+    assert any("UNSAFE_FMT" in text for text in _explanations(paths)), _explanations(paths)
+
+
+def test_c_macro_expanding_to_a_bounded_call_is_not_a_sink() -> None:
+    """Negative control: strncpy is bounded, so SAFE_COPY must not be a sink."""
+    paths = _scan(
+        {
+            "src/m.c": "#define SAFE_COPY(d, s, n) strncpy((d), (s), (n))\n"
+            "void handle(int fd) {\n"
+            "    char a[64];\n"
+            "    char b[64];\n"
+            "    read(fd, b, 64);\n"
+            "    SAFE_COPY(a, b, 63);\n"
+            "}\n"
+        }
+    )
+    assert not any("SAFE_COPY" in text for text in _explanations(paths)), _explanations(paths)
+
+
+def test_c_input_buffers_do_not_leak_between_functions() -> None:
+    """Two callers of read() must not appear to taint each other's buffers."""
+    paths = _scan(
+        {
+            "src/m.c": "void first(int fd) {\n"
+            "    char alpha[64];\n"
+            "    read(fd, alpha, 64);\n"
+            "}\n"
+            "void second(int fd) {\n"
+            "    char beta[64];\n"
+            "    read(fd, beta, 64);\n"
+            "    system(beta);\n"
+            "}\n"
+        }
+    )
+    reaching = [p for p in paths if "system" in p["explanation"]]
+    assert reaching, _explanations(paths)
+    assert not any("alpha" in p["explanation"] for p in reaching), _explanations(paths)
 
 
 def test_c_constant_argument_is_not_reported() -> None:
