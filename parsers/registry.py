@@ -33,9 +33,10 @@ def iter_parser_classes() -> Iterable[Type[object]]:
     irrelevant for correctness — placement at the end is defensive.
     """
     # Local imports prevent circular-import issues at module load time.
-    from parsers.engines import (
+    from parsers.engines import PythonParser
+    from parsers.generic_engine import (
         CSharpParser, GoParser, JavaParser, JavaScriptParser,
-        PHPParser, PythonParser, RubyParser,
+        PHPParser, RubyParser, TSXParser, TypeScriptParser,
     )
     from parsers.rust_engine import RustParser  # IR v0.3.0
     from parsers.c_engine import CParser        # IR v0.3.0
@@ -43,6 +44,8 @@ def iter_parser_classes() -> Iterable[Type[object]]:
     builtins: List[Type[object]] = [
         PythonParser,
         JavaScriptParser,
+        TypeScriptParser,
+        TSXParser,
         GoParser,
         JavaParser,
         PHPParser,

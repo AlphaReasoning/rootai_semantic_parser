@@ -1,7 +1,11 @@
 """Parser package exports."""
 
 from parsers.registry import PARSER_PLUGINS, iter_parser_classes, register_parser
-from parsers.engines import CSharpParser, GoParser, JavaParser, JavaScriptParser, PHPParser, PythonParser, RubyParser
+from parsers.engines import PythonParser
+from parsers.generic_engine import (
+    CSharpParser, GoParser, JavaParser, JavaScriptParser,
+    PHPParser, RubyParser, TSXParser, TypeScriptParser,
+)
 from parsers.rust_engine import RustParser
 from parsers.c_engine import CParser
 
@@ -16,6 +20,8 @@ __all__ = [
     "PythonParser",
     "RubyParser",
     "RustParser",
+    "TSXParser",
+    "TypeScriptParser",
     "iter_parser_classes",
     "register_parser",
 ]

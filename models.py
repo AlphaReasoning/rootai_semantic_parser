@@ -247,6 +247,17 @@ class TaintConfig:
             "rocket::request::Form",
             "warp::body::json",
             "tokio::net::TcpStream",
+            # --- Web/backend language sources ---
+            "req.query", "req.body", "req.params", "req.cookies",
+            "process.argv", "process.env", "location.search",
+            "os.Getenv", "r.FormValue", "r.PostFormValue", "r.Header.Get",
+            "mux.Vars", "c.Param", "c.Query",
+            "getParameter", "getHeader", "getQueryString", "getInputStream",
+            "HttpServletRequest", "RequestParam", "PathVariable",
+            "Request.Query", "Request.Form", "Request.Headers", "Request.Body",
+            "Environment.GetEnvironmentVariable",
+            "_GET", "_POST", "_REQUEST", "_COOKIE", "_FILES", "_SERVER",
+            "file_get_contents", "ARGV", "ENV",
             # --- IR v0.3.0: C sources ---
             "fgets",
             "fread",
@@ -281,6 +292,14 @@ class TaintConfig:
             "std::ptr::read",
             "sqlx::query",
             "rusqlite::Connection::execute",
+            # --- Web/backend language sinks ---
+            "execSync", "spawnSync", "child_process.exec", "child_process.spawn",
+            "vm.runInNewContext", "document.write", "setTimeout",
+            "exec.CommandContext", "template.HTML", "db.Query", "db.Exec",
+            "ProcessBuilder", "executeQuery", "executeUpdate", "ScriptEngine.eval",
+            "Process.Start", "SqlCommand", "Assembly.Load",
+            "shell_exec", "proc_open", "popen", "mysqli_query", "include", "require_once",
+            "instance_eval", "Open3.capture3", "Kernel.system",
             # --- IR v0.3.0: C sinks ---
             "system",
             "popen",

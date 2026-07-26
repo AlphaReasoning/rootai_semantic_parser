@@ -75,7 +75,7 @@ That path shows the repo intake, visible machine workflow, semantic reasoning, a
 
 ## Command Deck Capabilities
 
-- **Polyglot parsing:** Python, JavaScript, Go, Java, C#, PHP, and Ruby support through the parser stack
+- **Polyglot parsing:** Python, JavaScript, TypeScript, Go, Java, C#, PHP, Ruby, Rust, and C — every language is parsed to a real syntax tree (Python via `ast`, the rest via tree-sitter) and contributes data-flow edges, not just declaration names. Each is covered by a detection test *and* a constant-input control in `tests/unit/test_polyglot.py`
 - **Formal semantic IR:** versioned node taxonomy, edge ontology, and explicit soundness/completeness boundaries
 - **Deterministic graph queries:** BFS, DFS, shortest path, reachability cones, SCCs, and degree centrality without LLM path computation
 - **Semantic graph construction:** nodes and edges representing structure, imports, relationships, and flow

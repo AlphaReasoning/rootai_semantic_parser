@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rootai-semantic-parser"
 version = "0.21.0"
-description = "Polyglot semantic parser with taint analysis and finding-profile policy."
+description = "Polyglot semantic parser with taint analysis across ten languages and finding-profile policy."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

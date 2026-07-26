@@ -24,17 +24,19 @@ from models import (
     TaintPath,
 )
 from parsers.engines import (
+    LanguageParser,
+    PythonParser,
+    TreeSitterParser,
+    resolve_tree_sitter_language,
+    safe_unparse,
+)
+from parsers.generic_engine import (
     CSharpParser,
     GoParser,
     JavaParser,
     JavaScriptParser,
-    LanguageParser,
     PHPParser,
-    PythonParser,
     RubyParser,
-    TreeSitterParser,
-    resolve_tree_sitter_language,
-    safe_unparse,
 )
 from reports.renderers import (
     GraphSnapshot,
