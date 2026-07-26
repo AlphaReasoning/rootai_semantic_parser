@@ -263,6 +263,34 @@ class CrossFileCallResolver:
 
             added += self._bind_arguments(node["id"], target, arguments, existing)
 
+        # Routes are commonly registered in one file for handlers declared in
+        # another (`app.get("/login", sessionHandler.handleLoginRequest)`), so a
+        # per-file pass cannot connect them.
+        pending_routes: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for node in self.graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            route = metadata.get("route")
+            declared = metadata.get("route_for")
+            if route and declared:
+                pending_routes.setdefault((node.get("language", ""), declared), metadata)
+        for node in self.graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            name = metadata.get("declares")
+            if not name or metadata.get("route") or metadata.get("synthetic"):
+                continue
+            source = pending_routes.get((node.get("language", ""), name))
+            if source:
+                metadata.update(
+                    {
+                        "entrypoint": True,
+                        "route": source["route"],
+                        "http_method": source.get("http_method"),
+                        "route_path": source.get("route_path"),
+                        "route_cross_file": True,
+                    }
+                )
+                added += 1
+
         # Some parsers have their call edges rewritten to the declaration before
         # this pass runs, so the arguments already point at the real function
         # rather than a stub. Bind those directly.

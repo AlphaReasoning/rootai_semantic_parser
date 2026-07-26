@@ -15,7 +15,9 @@ from models import AnalysisOptions, EdgeRelation, TaintConfig, TaintPath
 _SEGMENT_SPLIT = re.compile(r"[^0-9A-Za-z_]+")
 
 #: Dataflow edges that record a declaration rather than a value transfer.
-_DECLARATION_FLOW_KINDS = frozenset({"binding", "local_decl", "let_binding"})
+_DECLARATION_FLOW_KINDS = frozenset(
+    {"binding", "local_decl", "let_binding", "assignment"}
+)
 
 #: SSA versioning suffix appended by the parsers (``user_input_v2``).
 _SSA_SUFFIX = re.compile(r"_v\d+$")
@@ -60,6 +62,31 @@ class TaintAnalyzer:
         self.taint_paths: List[TaintPath] = []
         self._node_idx: Dict[str, Dict] = {n["id"]: n for n in graph.get("nodes", [])}
         self._segment_cache: Dict[Any, Tuple[str, ...]] = {}
+        # value node -> the function that declares it. Declaration edges are not
+        # value flow, but they do record ownership, which is how a finding is
+        # attributed to the route its enclosing handler serves.
+        self._enclosing_function: Dict[str, str] = {}
+        for edge in graph.get("edges", []):
+            metadata = edge.get("metadata") or {}
+            if edge.get("relation") == EdgeRelation.DATAFLOW.value and metadata.get(
+                "flow_kind"
+            ) in _DECLARATION_FLOW_KINDS | {"parameter"}:
+                self._enclosing_function.setdefault(edge["target"], edge["source"])
+            elif edge.get("relation") == EdgeRelation.CONTAINS.value:
+                self._enclosing_function.setdefault(edge["target"], edge["source"])
+
+        # Positional fallback. Some values have no declaration edge at all --
+        # Flask's `request` is a module-level proxy, not a parameter -- so they
+        # would be attributed to no function and inherit no route. The nearest
+        # function declared above them in the same file is the right owner.
+        self._functions_by_file: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+        for node in graph.get("nodes", []):
+            if node.get("type") == "Function" and not (node.get("metadata") or {}).get("synthetic"):
+                self._functions_by_file[str(node.get("file", ""))].append(
+                    (int(node.get("lineno") or 0), node["id"])
+                )
+        for entries in self._functions_by_file.values():
+            entries.sort()
         self._adj: Dict[str, List[Tuple[str, str, float]]] = defaultdict(list)
         for edge in graph.get("edges", []):
             for source, target, relation, weight in self._propagations(edge):
@@ -180,6 +207,19 @@ class TaintAnalyzer:
             label_segments[index : index + span] == pattern_segments
             for index in range(len(label_segments) - span + 1)
         )
+
+    def _enclosing_by_position(self, node: Dict) -> Optional[Dict]:
+        """Return the nearest function declared above ``node`` in the same file."""
+        lineno = node.get("lineno")
+        if not lineno:
+            return None
+        best: Optional[str] = None
+        for declared_line, fn_id in self._functions_by_file.get(str(node.get("file", "")), []):
+            if declared_line <= lineno:
+                best = fn_id
+            else:
+                break
+        return self._node_idx.get(best) if best else None
 
     def _matches(self, node: Dict, keyword_set: Set[str]) -> bool:
         label_segments = self._node_segments(node)
@@ -352,10 +392,49 @@ class TaintAnalyzer:
     def _path_metadata(self, path: List[str], sink_node: Dict, sanitized: bool, severity: str) -> Dict[str, Any]:
         nodes = [self._node_idx.get(nid, {}) for nid in path]
         labels = [node.get("label", "?") for node in nodes]
-        entrypoints = [self._location(node) for node in nodes if node.get("metadata", {}).get("entrypoint")]
+        # A declared route is direct evidence of external reachability, and it
+        # carries the URL an operator needs in order to test the finding.
+        # Walk out to each node's declaring function: the route is recorded on
+        # the handler, and with declaration edges no longer carrying taint the
+        # handler itself is not on the data path.
+        context: List[Dict] = list(nodes)
+        for node in nodes:
+            current = node.get("id")
+            if current not in self._enclosing_function:
+                owner = self._enclosing_by_position(node)
+                if owner:
+                    context.append(owner)
+            for _ in range(4):
+                current = self._enclosing_function.get(current)
+                if not current:
+                    break
+                owner = self._node_idx.get(current)
+                if owner:
+                    context.append(owner)
+
+        routes = sorted(
+            {
+                str(item.get("metadata", {}).get("route"))
+                for item in context
+                if item.get("metadata", {}).get("route")
+            }
+        )
+        entrypoints = sorted(
+            {
+                f"{item['metadata']['route']} ({self._location(item)})"
+                if item.get("metadata", {}).get("route")
+                else self._location(item)
+                for item in context
+                if item.get("metadata", {}).get("entrypoint")
+            }
+        )
         file_paths = [str(node.get("file", "")) for node in nodes]
         reachable = True
         if self.options.enable_reachability:
+            # Prefer the declared route. The label heuristic below is a fallback
+            # for code whose framework is not modelled; on its own it inverted
+            # the ranking, marking an unrouted helper reachable because a label
+            # contained "query" while a real routed endpoint scored lower.
             reachable = bool(entrypoints) or any(
                 any(token in node.get("label", "").lower() for token in self._REACHABILITY_LABEL_HINTS)
                 for node in nodes
@@ -373,6 +452,10 @@ class TaintAnalyzer:
         is_test_path = any(any(token in item.lower() for token in ("/test", "/tests", "_test.", ".spec.", ".test.")) for item in file_paths)
         is_library_path = any(any(token in item.lower() for token in ("/site-packages/", "/vendor/", "/dist/")) for item in file_paths)
         dead_code = not reachable and not entrypoints
+        if routes:
+            # Confirmed externally reachable, which is what separates an
+            # exploitable finding from an internal helper.
+            score += 10.0
         if not reachable:
             score -= 30.0
         if auth_guarded:
@@ -406,6 +489,7 @@ class TaintAnalyzer:
             "source_label": source_label,
             "sink_label": sink_label,
             "explanation": explanation,
+            "routes": routes,
             "validation_guards": validation_guards,
             "test_only": is_test_path,
             "dead_code": dead_code,
@@ -564,6 +648,7 @@ class TaintAnalyzer:
                         potential_impact=metadata["potential_impact"],
                         payload_hints=metadata["payload_hints"],
                         validation_guards=metadata["validation_guards"],
+                        routes=metadata["routes"],
                         source_location=metadata["source_location"],
                         sink_location=metadata["sink_location"],
                         entrypoints=metadata["entrypoints"],

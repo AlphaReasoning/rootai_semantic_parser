@@ -968,6 +968,8 @@ class TaintPath:
     #: Conditional tests that constrained a value on this path. Surfaced so an
     #: operator can see *why* a finding was downgraded, not merely that it was.
     validation_guards: List[str] = field(default_factory=list)
+    #: HTTP routes this path is reachable from, e.g. "POST /admin/exec".
+    routes: List[str] = field(default_factory=list)
     source_location: str = ""
     sink_location: str = ""
     entrypoints: List[str] = field(default_factory=list)

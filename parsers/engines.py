@@ -227,6 +227,34 @@ class PythonParser(LanguageParser):
                 )
                 metadata["auth_guard"] = any(token in d.lower() for d in decorators for token in self._AUTH_GUARD_HINTS)
                 _mark_function_entrypoint(self.nodes[nid], node.name, metadata)
+                # A route decorator states the URL this function answers on,
+                # which is worth more when triaging than the fact of the flow.
+                for decorator in decorators:
+                    lowered = decorator.lower()
+                    if not any(
+                        token in lowered
+                        for token in ("route", ".get(", ".post(", ".put(", ".delete(", ".patch(")
+                    ):
+                        continue
+                    route_path = ""
+                    for quote in ("'", '"'):
+                        if quote in decorator:
+                            parts = decorator.split(quote)
+                            if len(parts) > 1:
+                                route_path = parts[1]
+                                break
+                    if not route_path:
+                        continue
+                    method = "route"
+                    for candidate in ("get", "post", "put", "delete", "patch"):
+                        if f".{candidate}(" in lowered:
+                            method = candidate
+                            break
+                    metadata["entrypoint"] = True
+                    metadata["route"] = f"{method.upper()} {route_path}"
+                    metadata["http_method"] = method
+                    metadata["route_path"] = route_path
+                    break
                 parent_id = module_id
                 for cls_id in class_map.values():
                     cls_node = self.nodes.get(cls_id)

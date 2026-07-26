@@ -35,6 +35,11 @@ from analyzers.symbols import SSAVersionTracker
 from models import AnalysisOptions, EdgeRelation, NodeType, SecurityConfig
 from parsers.engines import TreeSitterParser, _mark_function_entrypoint
 
+#: Function body containers. A declaration's own name is never inside one.
+_BODY_NODES: FrozenSet[str] = frozenset(
+    {"block", "statement_block", "function_body", "compound_statement", "body_statement", "do_block"}
+)
+
 #: Token types that separate a binding's target from its value.
 _ASSIGN_OPERATORS: FrozenSet[str] = frozenset({"=", ":=", "<-"})
 
@@ -88,6 +93,27 @@ class LanguageProfile:
     #: Those are synthesised in order so arguments still bind to something.
     positional_parameters: bool = False
 
+    #: Call names that register an HTTP route, as `app.get(path, handler)` or
+    #: `router.post(...)`. Detecting these gives a real entry point and the URL
+    #: it is reachable at, instead of guessing from the handler's name.
+    route_registrars: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                "get", "post", "put", "delete", "patch", "head", "options",
+                "all", "use", "route", "handle", "handlefunc", "handler",
+                "addroute", "map", "when",
+            }
+        )
+    )
+
+    #: Annotations or decorators that declare a route on the function they
+    #: precede: Spring's @GetMapping, Flask's @app.route, C#'s [HttpGet].
+    route_annotation_nodes: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(
+            {"annotation", "marker_annotation", "attribute", "attribute_list", "decorator"}
+        )
+    )
+
     #: Conditional constructs, and the statements that abandon the current path.
     #: A test on a tainted value whose failure branch exits is a validation
     #: guard: the value only reaches later code if it passed the check.
@@ -128,6 +154,10 @@ class GenericTreeSitterParser(TreeSitterParser):
         # declared below its first use.
         self._call_sites: List[Tuple[str, str, List[str]]] = []
         self._pending_function_name: Optional[str] = None
+        # Routes registered by name before the handler is declared.
+        self._route_handlers_by_name: Dict[str, List[Tuple[str, str, str]]] = {}
+        #: (start_byte, end_byte) of an inline handler -> the route it serves.
+        self._route_by_span: Dict[Tuple[int, int], Tuple[str, str, str]] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -153,6 +183,8 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._functions_by_name = {}
         self._function_params = {}
         self._call_sites = []
+        self._route_handlers_by_name = {}
+        self._route_by_span = {}
 
         module_id = self._make_id(path, "__module__")
         module_node = self._make_node(
@@ -168,6 +200,7 @@ class GenericTreeSitterParser(TreeSitterParser):
 
         self._walk(tree.root_node, source, path, module_id, module_id)
         self._resolve_call_targets()
+        self._apply_deferred_routes()
 
     # ------------------------------------------------------------------
     # Traversal
@@ -189,6 +222,9 @@ class GenericTreeSitterParser(TreeSitterParser):
             self._note_guard(node, src, fn_id)
 
         if node_type in self.profile.call_nodes:
+            self._note_route_registration(node, src, path, fn_id)
+
+        if node_type in self.profile.call_nodes:
             self._visit_call(node, src, path, fn_id)
 
         for child in node.children:
@@ -197,11 +233,23 @@ class GenericTreeSitterParser(TreeSitterParser):
     def _visit_function(self, node, src: str, path: str, parent_id: str, enclosing_fn: str) -> None:
         name = self._function_name(node, src)
         lineno = node.start_point[0] + 1
+        declared_route = self._route_by_span.get((node.start_byte, node.end_byte))
         fn_id = self._make_id(path, f"{parent_id}::fn::{name}:{lineno}")
 
         fn_node = self._make_node(fn_id, NodeType.FUNCTION, name, path, lineno)
         fn_node.metadata.update({"language": self.profile.language, "qualified_name": name})
         _mark_function_entrypoint(fn_node, name)
+        if declared_route:
+            route_label, route_method, route_target = declared_route
+            fn_node.metadata.update(
+                {
+                    "entrypoint": True,
+                    "route": route_label,
+                    "http_method": route_method,
+                    "route_path": route_target,
+                }
+            )
+        self._note_route_annotation(node, src, fn_node)
         self.nodes[fn_id] = fn_node
         self.edges.append(self._edge(parent_id, fn_id, EdgeRelation.CONTAINS))
 
@@ -383,6 +431,17 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
         return callee_id
 
+    def _apply_deferred_routes(self) -> None:
+        """Attach routes registered before their handler was declared."""
+        for name, registrations in self._route_handlers_by_name.items():
+            for fn_id in self._functions_by_name.get(name, []):
+                label, method, route_path = registrations[0]
+                metadata = self.nodes[fn_id].metadata
+                metadata["entrypoint"] = True
+                metadata["route"] = label
+                metadata["http_method"] = method
+                metadata["route_path"] = route_path
+
     def _resolve_call_targets(self) -> None:
         """Connect each call to the function body it enters.
 
@@ -466,6 +525,11 @@ class GenericTreeSitterParser(TreeSitterParser):
             )
             node.is_unsafe = True
             self.nodes[value_id] = node
+            # Declaration edge so the value is attributed to its enclosing
+            # function, which is what carries the route.
+            self.edges.append(
+                self._edge(fn_id, value_id, EdgeRelation.DATAFLOW, {"flow_kind": "binding"})
+            )
         return value_id
 
     #: Tests that constrain a value to a known-good set. Passing one of these
@@ -509,6 +573,143 @@ class GenericTreeSitterParser(TreeSitterParser):
                 # Recorded the way an explicit sanitizer is, so the analyzer
                 # treats a passed allowlist check as defending the value.
                 metadata["sanitizer_for"] = ["*"]
+
+    _HTTP_METHODS = frozenset({"get", "post", "put", "delete", "patch", "head", "options", "all", "use"})
+
+    #: Annotation names that declare an HTTP route on the method they precede.
+    _ROUTE_ANNOTATIONS = (
+        "getmapping", "postmapping", "putmapping", "deletemapping",
+        "patchmapping", "requestmapping", "httpget", "httppost", "httpput",
+        "httpdelete", "httppatch", "route", "path",
+    )
+
+    def _note_route_annotation(self, node, src: str, fn_node) -> None:
+        """Record a route declared by an annotation rather than a call.
+
+        Spring and ASP.NET attach the route to the method itself, so there is no
+        registration call to observe. The annotation names both the method and
+        the path.
+        """
+        # Java nests annotations inside a `modifiers` node and C# inside
+        # `attribute_list`, so a direct-children scan finds nothing.
+        candidates: List[Any] = []
+        for child in node.children:
+            if child.type in self.profile.route_annotation_nodes:
+                candidates.append(child)
+            elif child.type in ("modifiers", "attribute_list", "decorators"):
+                candidates.extend(
+                    item
+                    for item in self._iter_all(child, include_self=True)
+                    if item.type in self.profile.route_annotation_nodes
+                )
+
+        for child in candidates:
+            text = self._get_text(src, child).strip()
+            lowered = text.lower().lstrip("@[")
+            matched = next((name for name in self._ROUTE_ANNOTATIONS if lowered.startswith(name)), None)
+            if not matched:
+                continue
+            route_path = ""
+            for quote in ('"', "'"):
+                if quote in text:
+                    parts = text.split(quote)
+                    if len(parts) > 1:
+                        route_path = parts[1]
+                        break
+            method = matched.replace("mapping", "").replace("http", "") or "any"
+            label = f"{method.upper()} {route_path}".strip()
+            fn_node.metadata["entrypoint"] = True
+            fn_node.metadata["route"] = label
+            fn_node.metadata["http_method"] = method
+            fn_node.metadata["route_path"] = route_path
+            return
+
+    def _note_route_registration(self, node, src: str, path: str, fn_id: str) -> None:
+        """Record an HTTP route and the handler it dispatches to.
+
+        `app.get("/run", handler)` states two things a name heuristic cannot: that
+        the handler is genuinely reachable from outside, and the URL to reach it
+        at. Both matter more than the fact of the flow when triaging.
+        """
+        callee_text, arguments = self._call_parts(node, src)
+        if arguments is None or not callee_text:
+            return
+        segments = [part for part in callee_text.replace("::", ".").split(".") if part]
+        if not segments or segments[-1].lower() not in self.profile.route_registrars:
+            return
+
+        method = segments[-1].lower()
+        route_path = ""
+        handlers: List[Any] = []
+        for child in arguments.children:
+            if not child.is_named:
+                continue
+            text = self._get_text(src, child).strip()
+            if not route_path and text[:1] in {'"', "'", "`"}:
+                route_path = text.strip("\"'`")
+                continue
+            handlers.append(child)
+        if not route_path or not route_path.startswith(("/", "*")):
+            return
+
+        label = f"{method.upper() if method in self._HTTP_METHODS else 'ANY'} {route_path}"
+        for handler in handlers:
+            self._attach_route(handler, src, path, fn_id, label, method, route_path)
+
+    def _attach_route(
+        self, handler, src: str, path: str, fn_id: str, label: str, method: str, route_path: str
+    ) -> None:
+        """Mark the handler for a route, whether inline or referenced by name."""
+        targets: List[str] = []
+        for candidate in self._iter_all(handler, include_self=True):
+            if candidate.type in self.profile.function_nodes:
+                # Inline handler: `app.get("/x", (req, res) => {...})`. Recorded
+                # against its span rather than visited here -- the walk reaches it
+                # moments later, and visiting it twice created a second, unrouted
+                # copy that the taint path then flowed through.
+                self._route_by_span[(candidate.start_byte, candidate.end_byte)] = (
+                    label,
+                    method,
+                    route_path,
+                )
+                return
+        else:
+            # `sessionHandler.handleLoginRequest` names the handler in its last
+            # segment; the first identifier is the object holding it.
+            handler_text = self._get_text(src, handler).strip()
+            name = handler_text.split(".")[-1].strip() if "." in handler_text else ""
+            if not name:
+                name = self._first_identifier_text(handler, src)
+            if name:
+                targets.extend(self._functions_by_name.get(name, []))
+                self._route_handlers_by_name.setdefault(name, []).append(
+                    (label, method, route_path)
+                )
+                # Also recorded on a marker node so a handler declared in another
+                # file can pick the route up after the graphs are merged.
+                marker_id = self._make_id(path, f"__route__{label}::{name}")
+                if marker_id not in self.nodes:
+                    marker = self._make_node(
+                        marker_id, NodeType.DATA, label, path, handler.start_point[0] + 1
+                    )
+                    marker.metadata.update(
+                        {
+                            "language": self.profile.language,
+                            "synthetic": "route_registration",
+                            "route": label,
+                            "http_method": method,
+                            "route_path": route_path,
+                            "route_for": name,
+                        }
+                    )
+                    self.nodes[marker_id] = marker
+
+        for target in targets:
+            metadata = self.nodes[target].metadata
+            metadata["entrypoint"] = True
+            metadata["route"] = label
+            metadata["http_method"] = method
+            metadata["route_path"] = route_path
 
     def _visit_import(self, node, src: str, path: str, module_id: str) -> None:
         """Record an import node and the alias it introduces."""
@@ -593,7 +794,11 @@ class GenericTreeSitterParser(TreeSitterParser):
                 current.type in self.profile.param_container_nodes
                 or current.type in self.profile.function_nodes
                 or current.type in self.profile.argument_container_nodes
+                or current.type in _BODY_NODES
             ):
+                # Never descend into the body: an anonymous handler would
+                # otherwise take the name of the first identifier it happens to
+                # use, colliding with that variable and hiding the real handler.
                 continue
             queue.extend(current.children)
         return "<anonymous>"

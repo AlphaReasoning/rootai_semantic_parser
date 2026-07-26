@@ -75,6 +75,25 @@ modelling guards and quietly dropping findings, and both directions are tested.
 Findings carry `validation_guards` so an operator can see *why* a path was
 downgraded rather than only that it was.
 
+## HTTP route modelling
+
+Entry points are read from route registrations rather than guessed from
+function names. Call-based registration (`app.get(path, handler)`,
+`router.post`, `http.HandleFunc`, Gin) and annotation- or decorator-based
+declaration (Spring `@GetMapping`, ASP.NET `[HttpGet]`, Flask `@app.route`,
+FastAPI `@app.get`) are all recognised, including handlers registered in one
+file and declared in another.
+
+This matters twice. It corrects the ranking — the name heuristic scored an
+unrouted helper *above* a routed admin endpoint, because the helper's labels
+happened to contain a word on the heuristic list. And it recovers the URL:
+findings carry `routes`, so NodeGoat reports
+
+    RCE   score 105  POST /contributions   contributions.js:32
+    SSRF  score  85  GET /research         research.js:16
+
+rather than naming a function. A URL is something an operator can go and test.
+
 ## Known limits this exercise exposed
 
 - **Recall is a floor, not a measurement.** These targets have documented
@@ -84,6 +103,6 @@ downgraded rather than only that it was.
   600,000-character lines took longer to parse than an entire project.
   `looks_generated()` skips those and the scan reports how many, so the gap is
   visible rather than silent.
-- **No framework routing.** Entry points are inferred from names, so a
-  vulnerability reachable only through a framework's routing table may be
-  missed.
+- **Routing coverage is per framework.** The registration styles listed above
+  are modelled; anything else falls back to the name heuristic, which is weak.
+  Middleware chains and dynamically built route tables are not followed.
