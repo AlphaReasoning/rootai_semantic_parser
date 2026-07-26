@@ -295,7 +295,20 @@ class PythonParser(LanguageParser):
                             prev_label = f"{var_name}_v{prev_ver_num}"
                             self.edges.append(self._edge(self._make_id(path, prev_label), var_id, EdgeRelation.DATAFLOW, {"flow_kind": "ssa"}))
                         new_target_ids.append(var_id)
+            # References that are only arguments to a call in the value must not
+            # get a direct edge to the target: the value they contribute passes
+            # *through* that call. Linking them directly created a shortcut
+            # around every transforming call, so `safe = shlex.quote(c)` let
+            # taint reach `safe` without ever touching the sanitizer.
+            call_arg_refs: Set[str] = set()
+            for sub_node in ast.walk(value_node):
+                if isinstance(sub_node, ast.Call):
+                    for call_arg in list(sub_node.args) + [kw.value for kw in sub_node.keywords]:
+                        call_arg_refs.update(self._value_refs(call_arg))
+
             for ref_label in value_refs:
+                if ref_label in call_arg_refs:
+                    continue
                 rhs_id = self._reference_id(path, ref_label, assign_line, taint_sources=taint_sources)
                 if not rhs_id:
                     continue

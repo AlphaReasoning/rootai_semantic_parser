@@ -202,6 +202,19 @@ class TaintAnalyzer:
         metadata = node.get("metadata") or {}
         return bool(metadata.get("is_taint_source") or metadata.get("tainted_by"))
 
+    def _is_sanitizer(self, node: Dict) -> bool:
+        """Return whether passing through this node defends the value.
+
+        Label matching alone is not enough: a parser can establish that a value
+        was validated by a guard (`if (!ALLOWED.includes(c)) return;`) which no
+        keyword in the node's own name would reveal. Gating on the label meant
+        that metadata was recorded and never read.
+        """
+        if self._matches(node, self.config.sanitizers):
+            return True
+        metadata = node.get("metadata") or {}
+        return bool(metadata.get("sanitizer_for") or metadata.get("sanitizer_categories"))
+
     def _is_taint_sink(self, node: Dict) -> bool:
         """Return whether a node is a dangerous operation.
 
@@ -224,9 +237,14 @@ class TaintAnalyzer:
             "os.system", "subprocess.run", "exec.command", "shell", "processbuilder",
             "system", "popen", "execve", "execl", "execv", "shell_exec", "proc_open",
             "invoke-expression", "os.execute", "process.start", "runtime.exec",
+            # Node's child_process family: named "exec*" but they spawn a shell
+            # command, not evaluate code, so a shell escaper is the right defence.
+            "execsync", "spawnsync", "child_process", "exec.commandcontext",
         }):
             categories.add("command")
-        if any(token in value for token in {"eval", "exec", "compile"}):
+        if "command" not in categories and any(
+            token in value for token in {"eval", "exec", "compile"}
+        ):
             categories.add("code")
         if any(token in value for token in {"cursor.execute", "db.execute", "query", "sql", "jdbc"}):
             categories.add("sql")
@@ -263,23 +281,51 @@ class TaintAnalyzer:
             categories.add("path")
         return categories or {"generic"}
 
-    @staticmethod
-    def _sanitizer_categories(node: Dict) -> Set[str]:
+    #: Sanitizers that change a value's *type* rather than escaping its content.
+    #: The result cannot carry an injection payload for any sink, so these
+    #: neutralise every category rather than one.
+    _UNIVERSAL_SANITIZERS = frozenset(
+        {
+            "int", "float", "long", "bool",
+            "parseint", "parsefloat", "number", "tonumber",
+            "atoi", "atof", "strconv.atoi", "strconv.parseint",
+            "integer.parseint", "double.parsedouble", "uuid", "int32.parse",
+        }
+    )
+
+    @classmethod
+    def _sanitizer_categories(cls, node: Dict) -> Set[str]:
         metadata = node.get("metadata", {})
         explicit = metadata.get("sanitizer_for") or metadata.get("sanitizer_categories") or []
         explicit_categories = {str(item).strip().lower() for item in explicit if str(item).strip()}
         if explicit_categories:
             return explicit_categories
         label = node.get("label", "").lower()
+        segments = cls._segments(label)
+        if any(name in cls._UNIVERSAL_SANITIZERS for name in segments):
+            # A value parsed into a number is safe everywhere, not merely against
+            # the categories a string escaper would cover.
+            return {"*"}
         categories: Set[str] = set()
-        if any(token in label for token in {"shlex.quote", "shellescape", "escape_shell", "quote"}):
+        if any(token in label for token in {
+            "shlex.quote", "shellescape", "escape_shell", "quote",
+            "escapeshellarg", "escapeshellcmd",
+        }):
             categories.add("command")
         if any(token in label for token in {"int", "float", "validate_number", "numeric", "integer.parseint"}):
             categories.update({"code", "sql"})
-        if any(token in label for token in {"html.escape", "bleach.clean", "escape_html"}):
-            categories.add("html")
-        if any(token in label for token in {"sql_escape", "param", "parameterize", "preparedstatement"}):
-            categories.add("sql")
+        if any(token in label for token in {
+            "html.escape", "bleach.clean", "escape_html", "escapehtml",
+            "htmlspecialchars", "sanitize_html", "dompurify", "encode_text",
+        }):
+            # Named for the sink class it defends, so it lines up with the
+            # category _sink_categories assigns to an XSS sink.
+            categories.update({"html", "xss"})
+        if any(token in label for token in {
+            "sql_escape", "param", "parameterize", "preparedstatement",
+            "preparestatement", "real_escape_string", "quote_ident",
+        }):
+            categories.update({"sql", "nosql"})
         if any(token in label for token in {"safe_load", "deserialize_safe"}):
             categories.add("deserialize")
         if any(token in label for token in {"sanitize", "validate", "validator"}):
@@ -292,6 +338,8 @@ class TaintAnalyzer:
     def _effective_sanitized(self, sanitizers: FrozenSet[str], sink_label: str) -> bool:
         if not sanitizers:
             return False
+        if "*" in sanitizers:
+            return True
         sink_categories = self._sink_categories(sink_label)
         return bool(sanitizers & sink_categories) or ("generic" in sanitizers and sink_categories == {"generic"})
 
@@ -313,6 +361,11 @@ class TaintAnalyzer:
                 for node in nodes
             )
         auth_guarded = self.options.enable_auth_checks and any(node.get("metadata", {}).get("auth_guard") for node in nodes)
+        validation_guards = [
+            str(node.get("metadata", {}).get("guard_test"))
+            for node in nodes
+            if node.get("metadata", {}).get("guarded")
+        ]
         impact = self._impact_for_sink(sink_node.get("label", ""))
         potential_impact = f"Potential {impact}" if not impact.lower().startswith("potential") else impact
         payload_hints = self._payload_hints(sink_node.get("label", ""))
@@ -353,6 +406,7 @@ class TaintAnalyzer:
             "source_label": source_label,
             "sink_label": sink_label,
             "explanation": explanation,
+            "validation_guards": validation_guards,
             "test_only": is_test_path,
             "dead_code": dead_code,
             "library_code": is_library_path,
@@ -413,12 +467,21 @@ class TaintAnalyzer:
             node = self._node_idx[nid]
             if self._is_taint_source(node):
                 self.tainted_nodes.add(nid)
-                state = (nid, frozenset())
+                # A guard can validate the very value that seeds the path
+                # (`c = req.query.c; if (!ALLOWED.includes(c)) return;`). Sanitizer
+                # state is otherwise only collected on arrival at a node, so a
+                # guarded source would carry none.
+                initial = (
+                    frozenset(self._sanitizer_categories(node))
+                    if self._is_sanitizer(node)
+                    else frozenset()
+                )
+                state = (nid, initial)
                 self._parent[state] = state
                 self._best_score[state] = 0.0
                 self._hop_count[state] = 0
                 self._fragility_sum[state] = 0.0
-                heapq.heappush(queue, (-0.0, 0, nid, ()))
+                heapq.heappush(queue, (-0.0, 0, nid, tuple(sorted(state[1]))))
 
         while queue:
             neg_score, hops, current, sanitizer_key = heapq.heappop(queue)
@@ -433,7 +496,7 @@ class TaintAnalyzer:
                 if not nb_node:
                     continue
                 next_categories = sanitizer_categories
-                if self._matches(nb_node, self.config.sanitizers):
+                if self._is_sanitizer(nb_node):
                     next_categories = frozenset(set(next_categories) | self._sanitizer_categories(nb_node))
                 next_state = (neighbor, next_categories)
                 next_hops = hops + 1
@@ -482,8 +545,11 @@ class TaintAnalyzer:
                     # sets. Reporting it produced findings like "system -> system".
                     continue
                 severity = "critical" if self._matches(node, self.config.critical_sinks) else "high"
-                if sanitized and severity != "critical":
-                    severity = "medium"
+                if sanitized:
+                    # Previously a critical sink stayed critical even with an
+                    # effective sanitizer on the path, which is the opposite of
+                    # what the evidence says.
+                    severity = "medium" if severity == "critical" else "low"
                 metadata = self._path_metadata(path, node, sanitized, severity)
                 self.taint_paths.append(
                     TaintPath(
@@ -497,6 +563,7 @@ class TaintAnalyzer:
                         impact=metadata["impact"],
                         potential_impact=metadata["potential_impact"],
                         payload_hints=metadata["payload_hints"],
+                        validation_guards=metadata["validation_guards"],
                         source_location=metadata["source_location"],
                         sink_location=metadata["sink_location"],
                         entrypoints=metadata["entrypoints"],

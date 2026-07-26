@@ -55,6 +55,26 @@ mature framework is a few seconds of human review, which is the bar that
 matters. Note these counts are pre-filter; a `semantic-parser scan` with the
 bugbounty profile reports fewer.
 
+## Sanitizers and validation guards
+
+A flow that was already defended is reported at reduced severity with the
+evidence attached, rather than identically to an undefended one.
+
+**Sanitizers** are recognised in two kinds. *Escapers* (`shlex.quote`,
+`escapeshellarg`, `html.escape`) defend the sink class they exist for, matched
+by category. *Type coercions* (`int`, `parseInt`, `Integer.parseInt`) defend
+every category, because a value parsed into a number cannot carry a payload for
+any sink at all.
+
+**Guards** are conditionals that test a value and abandon the path when it
+fails, so downstream code only sees input that passed. `if (!ALLOWED.includes(c))
+return;` constrains what `c` can be; `if (c.length > 100) return;` does not, and
+is deliberately not treated as validation. The distinction is the line between
+modelling guards and quietly dropping findings, and both directions are tested.
+
+Findings carry `validation_guards` so an operator can see *why* a path was
+downgraded rather than only that it was.
+
 ## Known limits this exercise exposed
 
 - **Recall is a floor, not a measurement.** These targets have documented

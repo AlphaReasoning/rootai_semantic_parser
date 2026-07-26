@@ -88,6 +88,24 @@ class LanguageProfile:
     #: Those are synthesised in order so arguments still bind to something.
     positional_parameters: bool = False
 
+    #: Conditional constructs, and the statements that abandon the current path.
+    #: A test on a tainted value whose failure branch exits is a validation
+    #: guard: the value only reaches later code if it passed the check.
+    conditional_nodes: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(
+            {"if_statement", "if_expression", "elif_clause", "conditional_expression", "if"}
+        )
+    )
+    exit_nodes: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                "return_statement", "throw_statement", "raise_statement",
+                "return_expression", "break_statement", "continue_statement",
+                "return", "throw", "raise", "exit_statement", "die_statement",
+            }
+        )
+    )
+
 
 class GenericTreeSitterParser(TreeSitterParser):
     """Shared graph builder driven by a :class:`LanguageProfile`."""
@@ -166,6 +184,9 @@ class GenericTreeSitterParser(TreeSitterParser):
         if node_type in self.profile.binding_nodes:
             self._visit_binding(node, src, path, fn_id)
             # Fall through: the value side may hold calls that still need visiting.
+
+        if node_type in self.profile.conditional_nodes:
+            self._note_guard(node, src, fn_id)
 
         if node_type in self.profile.call_nodes:
             self._visit_call(node, src, path, fn_id)
@@ -256,8 +277,20 @@ class GenericTreeSitterParser(TreeSitterParser):
                 self.nodes[var_id].metadata["is_taint_source"] = True
                 self.nodes[var_id].metadata["tainted_by"] = value_text[:96]
 
-            # Identifiers read on the value side flow into the binding.
+            # Identifiers that are only arguments to a call in the value do not
+            # flow directly into the binding -- their contribution passes through
+            # that call. A direct edge would route taint around any sanitizer.
+            call_argument_values: Set[str] = set()
+            for call in self._iter_calls(value_nodes):
+                _, call_arguments = self._call_parts(call, src)
+                if call_arguments is not None:
+                    call_argument_values.update(
+                        self._referenced_values([call_arguments], src, fn_id)
+                    )
+
             for referenced in self._referenced_values(value_nodes, src, fn_id):
+                if referenced in call_argument_values:
+                    continue
                 if referenced != var_id:
                     self.edges.append(
                         self._edge(
@@ -434,6 +467,48 @@ class GenericTreeSitterParser(TreeSitterParser):
             node.is_unsafe = True
             self.nodes[value_id] = node
         return value_id
+
+    #: Tests that constrain a value to a known-good set. Passing one of these
+    #: bounds what the value can be, so it defends every sink category. A length
+    #: or null check does not, and is recorded without that claim.
+    _CONSTRAINING_TESTS = (
+        " in ", "includes", "indexof", "has(", "contains", "==", "===",
+        "fullmatch", "match(", "test(", "startswith", "endswith",
+        "allowlist", "whitelist", "isvalid", "validate",
+        ".equals", "in_array", "array_search", "array_key_exists",
+        "containskey", "hasprefix", "hassuffix", "elem",
+    )
+
+    def _note_guard(self, node, src: str, fn_id: str) -> None:
+        """Mark values validated by a conditional whose failure branch exits.
+
+        `if (!ALLOWED.includes(c)) return;` means everything after it sees a `c`
+        that passed the check. Without modelling this, validated input is
+        reported exactly like unvalidated input, which is the largest remaining
+        noise source on code that does the right thing.
+        """
+        children = [c for c in node.children if c.is_named]
+        if not children:
+            return
+        test = children[0]
+        body = children[1:]
+        if not any(
+            candidate.type in self.profile.exit_nodes
+            for branch in body
+            for candidate in self._iter_all(branch, include_self=True)
+        ):
+            return
+
+        test_text = self._get_text(src, test).lower()
+        constraining = any(token in test_text for token in self._CONSTRAINING_TESTS)
+        for value_id in self._referenced_values([test], src, fn_id):
+            metadata = self.nodes[value_id].metadata
+            metadata["guarded"] = True
+            metadata["guard_test"] = self._get_text(src, test)[:120]
+            if constraining:
+                # Recorded the way an explicit sanitizer is, so the analyzer
+                # treats a passed allowlist check as defending the value.
+                metadata["sanitizer_for"] = ["*"]
 
     def _visit_import(self, node, src: str, path: str, module_id: str) -> None:
         """Record an import node and the alias it introduces."""

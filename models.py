@@ -361,7 +361,11 @@ class TaintConfig:
             "validate",
             "bleach.clean",
             "re.escape",
-            "shlex.quote",
+            "shlex.quote", "shellescape", "escapeshellarg", "escapeshellcmd",
+            "parseInt", "parseFloat", "Number", "tonumber", "atoi",
+            "escapeHtml", "htmlspecialchars", "DOMPurify.sanitize", "sanitize_html",
+            "prepareStatement", "real_escape_string", "quote_ident",
+            "Integer.parseInt", "Double.parseDouble", "int32.Parse", "uuid",
             # --- IR v0.3.0: Rust sanitizers ---
             "html_escape::encode_text",
             "percent_encoding::percent_encode",
@@ -961,6 +965,9 @@ class TaintPath:
     impact: str = "generic"
     potential_impact: str = "Potential generic sink"
     payload_hints: List[str] = field(default_factory=list)
+    #: Conditional tests that constrained a value on this path. Surfaced so an
+    #: operator can see *why* a finding was downgraded, not merely that it was.
+    validation_guards: List[str] = field(default_factory=list)
     source_location: str = ""
     sink_location: str = ""
     entrypoints: List[str] = field(default_factory=list)
