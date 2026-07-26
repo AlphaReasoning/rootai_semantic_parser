@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import argparse
 import json
 import logging
@@ -11,7 +13,7 @@ from config import SUPPORTED_PROFILES, load_finding_profile, load_ruleset
 from core.runtime import CVEEnricher, MultiFileParser, changed_files_between_commits
 from evaluation import evaluate_graph_queries, load_evaluation_cases
 from feedback import FeedbackEntry, apply_feedback_scores, feedback_stats, load_feedback_db, record_feedback, tune_rules
-from graph_queries import GraphQueryEngine, render_query_text
+from graph_queries import GraphQueryError, GraphQueryEngine, render_query_text
 from models import AnalysisOptions, FindingProfile, SecurityConfig, TaintConfig, formal_ir_spec
 from plugins.loader import load_plugin_modules
 from reports import (
@@ -140,7 +142,35 @@ def _build_cli() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entrypoint."""
+    """CLI entrypoint.
+
+    Domain errors are reported as a message on stderr rather than a traceback.
+    A bad query expression or an unreadable config file is a usage problem, not
+    a crash, and a stack trace tells the operator nothing actionable.
+    """
+    try:
+        return _main(argv)
+    except GraphQueryError as exc:
+        print(f"query error: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"file not found: {exc.filename or exc}", file=sys.stderr)
+        return 2
+    except IsADirectoryError as exc:
+        print(f"expected a file: {exc.filename or exc}", file=sys.stderr)
+        return 2
+    except PermissionError as exc:
+        print(f"permission denied: {exc.filename or exc}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as exc:
+        print(f"invalid JSON: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
     cli = _build_cli()
     args = cli.parse_args(argv)
 

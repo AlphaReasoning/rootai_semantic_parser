@@ -240,12 +240,18 @@ class PythonParser(LanguageParser):
                     args_list.append(node.args.vararg)
                 if node.args.kwarg:
                     args_list.append(node.args.kwarg)
+                # Recorded for CrossFileCallResolver, which binds a caller's
+                # arguments to these parameters positionally.
+                metadata["declares"] = node.name
+                param_ids: List[str] = []
                 for arg in args_list:
                     arg_name = arg.arg
                     ssa_label = arg_name if self.options.quick_mode else self.ssa.get_versioned_id(arg_name)
                     var_id = self._make_id(path, ssa_label)
                     self.nodes[var_id] = self._make_node(var_id, NodeType.VARIABLE, ssa_label, path, node.lineno)
                     self.edges.append(self._edge(nid, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "parameter"}))
+                    param_ids.append(var_id)
+                metadata["param_ids"] = param_ids
             elif isinstance(node, ast.Call):
                 deferred_calls.append(node)
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -315,11 +321,18 @@ class PythonParser(LanguageParser):
             caller_id = self._enclosing(call_line, fn_ranges, module_id)
             self._ensure_call_target(path, callee_name, call_line)
             self.edges.append(self._edge(caller_id, callee_id, EdgeRelation.CALLS, {"static": True, "call_name": callee_name}))
-            for arg in call_node.args:
+            for arg_index, arg in enumerate(call_node.args):
                 for ref_label in self._value_refs(arg):
                     arg_id = self._reference_id(path, ref_label, call_line, taint_sources=taint_sources)
                     if arg_id:
-                        self.edges.append(self._edge(arg_id, callee_id, EdgeRelation.DATAFLOW, {"flow_kind": "call_argument"}))
+                        self.edges.append(
+                            self._edge(
+                                arg_id,
+                                callee_id,
+                                EdgeRelation.DATAFLOW,
+                                {"flow_kind": "call_argument", "arg_index": arg_index},
+                            )
+                        )
                         if self.nodes.get(arg_id) and self.nodes[arg_id].is_unsafe:
                             self.nodes[callee_id].is_unsafe = True
 
@@ -386,7 +399,13 @@ class PythonParser(LanguageParser):
         callee_id = self._make_id(path, callee_name)
         if callee_id not in self.nodes:
             node = self._make_node(callee_id, NodeType.FUNCTION, callee_name, path, lineno)
-            node.metadata.update({"synthetic": "call_target", "call_name": callee_name})
+            node.metadata.update(
+                {
+                    "synthetic": "call_target",
+                    "call_name": callee_name,
+                    "callee_short": callee_name.split(".")[-1],
+                }
+            )
             self.nodes[callee_id] = node
         return callee_id
 

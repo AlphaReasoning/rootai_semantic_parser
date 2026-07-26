@@ -220,7 +220,6 @@ def test_structural_relations_do_not_carry_taint() -> None:
 def test_value_carrying_relations_propagate() -> None:
     for relation in (
         EdgeRelation.DATAFLOW,
-        EdgeRelation.CALLS,
         EdgeRelation.UNSAFE_DEREFERENCE,
         EdgeRelation.POINTER_ARITH,
         EdgeRelation.BORROWS,
@@ -248,11 +247,36 @@ def test_field_access_propagates_in_both_directions() -> None:
     assert len(backward) == 1
 
 
-def test_parameter_dataflow_propagates_toward_the_function() -> None:
-    """The edge runs function -> parameter, but the value flows the other way."""
+def test_a_call_edge_alone_does_not_carry_data() -> None:
+    """Regression: calls are control flow, not data flow.
+
+    Propagating along the call edge, combined with treating a parameter edge as
+    value flow into its function, meant any tainted value in a function
+    implicated everything that function invoked -- a parameter merely named
+    "req" was enough. Data reaches a callee through argument_binding.
+    """
     paths = _run(
-        [_node("fn", "system"), _node("param", "getenv")],
-        [_edge("fn", "param", EdgeRelation.DATAFLOW, flow_kind="parameter")],
+        [_node("a", "getenv"), _node("b", "system")],
+        [_edge("a", "b", EdgeRelation.CALLS)],
+    )
+    assert paths == []
+
+
+def test_declaration_edges_do_not_carry_data() -> None:
+    """function -> parameter / -> local records a declaration, not a transfer."""
+    for flow_kind in ("parameter", "binding", "local_decl", "let_binding"):
+        paths = _run(
+            [_node("fn", "getenv"), _node("var", "system")],
+            [_edge("fn", "var", EdgeRelation.DATAFLOW, flow_kind=flow_kind)],
+        )
+        assert paths == [], flow_kind
+
+
+def test_argument_binding_carries_data_into_a_parameter() -> None:
+    """This is how a value actually reaches a callee."""
+    paths = _run(
+        [_node("arg", "getenv"), _node("param", "system")],
+        [_edge("arg", "param", EdgeRelation.DATAFLOW, flow_kind="argument_binding")],
     )
     assert len(paths) == 1
 

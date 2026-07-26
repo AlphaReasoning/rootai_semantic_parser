@@ -84,6 +84,10 @@ class LanguageProfile:
     #: (arrow functions, lambdas, blocks passed to methods).
     closure_nodes: FrozenSet[str] = field(default_factory=frozenset)
 
+    #: Shell-style languages have no named parameters; a function reads $1, $2.
+    #: Those are synthesised in order so arguments still bind to something.
+    positional_parameters: bool = False
+
 
 class GenericTreeSitterParser(TreeSitterParser):
     """Shared graph builder driven by a :class:`LanguageProfile`."""
@@ -181,12 +185,23 @@ class GenericTreeSitterParser(TreeSitterParser):
         self.edges.append(self._edge(parent_id, fn_id, EdgeRelation.CONTAINS))
 
         param_ids: List[str] = []
+        if self.profile.positional_parameters:
+            for position in sorted(self._positional_parameters(node, src)):
+                param_ids.append(
+                    # Stored without the sigil: value lookups strip "$" before
+                    # matching, so "$1" would never resolve.
+                    self._declare_value(str(position), path, fn_id, lineno, "parameter")
+                )
         for param_name, param_node in self._parameters(node, src):
             param_ids.append(
                 self._declare_value(param_name, path, fn_id, param_node.start_point[0] + 1, "parameter")
             )
         self._function_params[fn_id] = param_ids
         self._functions_by_name.setdefault(name, []).append(fn_id)
+        # Exposed on the node so cross-file resolution can bind arguments to
+        # parameters after the per-file graphs are merged.
+        fn_node.metadata["param_ids"] = param_ids
+        fn_node.metadata["declares"] = name
 
         for child in node.children:
             self._walk(child, src, path, fn_id, fn_id)
@@ -218,6 +233,15 @@ class GenericTreeSitterParser(TreeSitterParser):
         for target in target_nodes:
             name = self._first_identifier_text(target, src)
             if not name:
+                # `this.handleUpdate = (req) => {...}` is the ordinary Node/Express
+                # idiom. The target is a member expression with no plain
+                # identifier, so bailing here left the handler body unvisited.
+                member_text = self._get_text(src, target).strip()
+                fallback = member_text.split(".")[-1].strip() if member_text else ""
+                for bound in bound_functions:
+                    self._pending_function_name = fallback or "<anonymous>"
+                    self._visit_function(bound, src, path, fn_id, fn_id)
+                    self._pending_function_name = None
                 continue
             # `handler <- function(c) {...}` declares handler; the function node
             # itself carries no name, so take it from the binding target.
@@ -287,6 +311,7 @@ class GenericTreeSitterParser(TreeSitterParser):
                     "synthetic": "call_target",
                     "call_name": callee_text,
                     "resolved_name": resolved,
+                    "callee_short": callee_text.split(".")[-1].strip(),
                     "is_taint_source": is_source,
                     "is_taint_sink": is_sink,
                 }
@@ -302,13 +327,24 @@ class GenericTreeSitterParser(TreeSitterParser):
         argument_ids: List[str] = []
         if arguments is not None:
             argument_ids = self._referenced_values([arguments], src, fn_id)
-            for referenced in argument_ids:
+            # An argument written inline -- `eval(req.body.x)` -- names no local,
+            # so it resolves to nothing. When its text matches a source pattern
+            # it is still attacker-controlled data arriving at this call, so give
+            # it a node rather than losing the flow.
+            inline = self._inline_source_argument(arguments, src, path, fn_id, taint_config)
+            if inline is not None and inline not in argument_ids:
+                argument_ids.append(inline)
+            for position, referenced in enumerate(argument_ids):
                 self.edges.append(
                     self._edge(
                         referenced,
                         callee_id,
                         EdgeRelation.DATAFLOW,
-                        {"flow_kind": "call_argument", "call_name": callee_text},
+                        {
+                            "flow_kind": "call_argument",
+                            "call_name": callee_text,
+                            "arg_index": position,
+                        },
                     )
                 )
         self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
@@ -360,6 +396,44 @@ class GenericTreeSitterParser(TreeSitterParser):
                         },
                     )
                 )
+
+    def _inline_source_argument(
+        self, arguments, src: str, path: str, fn_id: str, taint_config
+    ) -> Optional[str]:
+        """Give an inline attacker-controlled argument expression a node.
+
+        Real handlers frequently pass request data straight into a sink without
+        binding it first. The expression names no declared value, so argument
+        resolution finds nothing and the flow disappears. Matching the argument
+        text against the source vocabulary recovers it as data, rather than
+        relying on call-graph reachability to imply it.
+        """
+        text = self._get_text(src, arguments).strip()
+        if not text or not self._matches_pattern(text, taint_config.sources):
+            return None
+        expression = text.strip("()").strip()
+        if not expression:
+            return None
+        value_id = self._make_id(path, f"{fn_id}::inline::{expression[:80]}")
+        if value_id not in self.nodes:
+            node = self._make_node(
+                value_id,
+                NodeType.DATA,
+                expression[:80],
+                path,
+                arguments.start_point[0] + 1,
+            )
+            node.metadata.update(
+                {
+                    "language": self.profile.language,
+                    "expression": expression[:120],
+                    "synthetic": "inline_argument",
+                    "is_taint_source": True,
+                }
+            )
+            node.is_unsafe = True
+            self.nodes[value_id] = node
+        return value_id
 
     def _visit_import(self, node, src: str, path: str, module_id: str) -> None:
         """Record an import node and the alias it introduces."""
@@ -480,6 +554,15 @@ class GenericTreeSitterParser(TreeSitterParser):
                     if name:
                         params.append((name, item))
         return params
+
+    def _positional_parameters(self, node, src: str) -> Set[int]:
+        """Return the positional parameter numbers a shell function reads."""
+        found: Set[int] = set()
+        for descendant in self._iter_all(node):
+            text = self._get_text(src, descendant).strip().lstrip("$")
+            if text.isdigit() and 1 <= int(text) <= 9:
+                found.add(int(text))
+        return found
 
     def _split_on_assignment(self, node) -> Tuple[List[Any], List[Any]]:
         """Split a binding's children at its assignment operator."""
@@ -934,6 +1017,7 @@ _BASH_PROFILE = LanguageProfile(
     argument_container_nodes=frozenset(),
     identifier_nodes=frozenset({"variable_name", "word"}),
     import_nodes=frozenset({"command"}),
+    positional_parameters=True,
 )
 
 _POWERSHELL_PROFILE = LanguageProfile(

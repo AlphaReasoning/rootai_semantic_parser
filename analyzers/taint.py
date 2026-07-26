@@ -14,6 +14,9 @@ from models import AnalysisOptions, EdgeRelation, TaintConfig, TaintPath
 #: their component names.
 _SEGMENT_SPLIT = re.compile(r"[^0-9A-Za-z_]+")
 
+#: Dataflow edges that record a declaration rather than a value transfer.
+_DECLARATION_FLOW_KINDS = frozenset({"binding", "local_decl", "let_binding"})
+
 #: SSA versioning suffix appended by the parsers (``user_input_v2``).
 _SSA_SUFFIX = re.compile(r"_v\d+$")
 
@@ -83,15 +86,30 @@ class TaintAnalyzer:
         metadata = edge.get("metadata") or {}
 
         if relation == EdgeRelation.CALLS.value:
-            return [(src, tgt, relation, weight)]
+            # Control flow, not data flow. A callee receives data through its
+            # arguments and returns it through its return value, both modelled
+            # as DATAFLOW. Propagating along the call edge itself combined with
+            # the reverse-parameter rule to make any tainted parameter implicate
+            # every function reachable from its body.
+            return []
 
         if relation == EdgeRelation.DATAFLOW.value:
             # A parameter edge runs function -> parameter, which is a binding
             # record. The value flows the other way: a tainted argument makes the
             # receiving function operate on tainted data, and the function's own
             # call-argument edges carry that onward to its callees.
-            if metadata.get("flow_kind") == "parameter":
-                return [(tgt, src, relation, weight)]
+            flow_kind = metadata.get("flow_kind")
+            if flow_kind == "parameter":
+                # Declaration record, like the binding kinds below. A tainted
+                # argument reaches this parameter through argument_binding.
+                return []
+            if flow_kind in _DECLARATION_FLOW_KINDS:
+                # function -> variable records *that* a local is declared here,
+                # not that the function's data flows into it. Treating it as
+                # value flow let a tainted parameter contaminate every local in
+                # the same function, and from there every call those locals fed.
+                # The value itself arrives via assignment_rhs or call_return.
+                return []
             return [(src, tgt, relation, weight)]
 
         if relation == EdgeRelation.FIELD_ACCESS.value:
@@ -202,7 +220,11 @@ class TaintAnalyzer:
     def _sink_categories(label: str) -> Set[str]:
         value = label.lower()
         categories: Set[str] = set()
-        if any(token in value for token in {"os.system", "subprocess.run", "exec.command", "sh", "shell", "processbuilder"}):
+        if any(token in value for token in {
+            "os.system", "subprocess.run", "exec.command", "shell", "processbuilder",
+            "system", "popen", "execve", "execl", "execv", "shell_exec", "proc_open",
+            "invoke-expression", "os.execute", "process.start", "runtime.exec",
+        }):
             categories.add("command")
         if any(token in value for token in {"eval", "exec", "compile"}):
             categories.add("code")
@@ -212,6 +234,33 @@ class TaintAnalyzer:
             categories.add("html")
         if any(token in value for token in {"pickle.loads", "yaml.load", "deserialize", "unserialize", "objectinputstream"}):
             categories.add("deserialize")
+        # Memory-safety sinks. Without this the entire C/C++/Rust sink vocabulary
+        # fell through to "generic", so buffer overflows were reported with no
+        # impact class and an understated severity.
+        if any(token in value for token in {
+            "strcpy", "strcat", "sprintf", "gets", "memcpy", "memmove", "alloca",
+            "stpcpy", "std::ptr::write", "std::ptr::read", "transmute",
+        }):
+            categories.add("memory")
+        if any(token in value for token in {
+            "needle.get", "axios", "http.get", "https.get", "requests.get",
+            "urlopen", "resttemplate", "urlconnection", "httpclient",
+        }):
+            categories.add("ssrf")
+        if any(token in value for token in {
+            "collection.find", "collection.update", "db.collection", "rawquery", "knex.raw",
+        }):
+            categories.add("nosql")
+        if any(token in value for token in {
+            "res.write", "res.send", "innerhtml", "outerhtml", "insertadjacenthtml",
+            "dangerouslysetinnerhtml", "document.write",
+        }):
+            categories.add("xss")
+        if any(token in value for token in {
+            "fs.readfile", "createreadstream", "sendfile", "fileinputstream",
+            "readalltext",
+        }):
+            categories.add("path")
         return categories or {"generic"}
 
     @staticmethod
@@ -319,6 +368,16 @@ class TaintAnalyzer:
             return "Deserialization"
         if "sql" in categories:
             return "SQL injection"
+        if "memory" in categories:
+            return "Memory corruption"
+        if "nosql" in categories:
+            return "NoSQL injection"
+        if "ssrf" in categories:
+            return "SSRF"
+        if "xss" in categories:
+            return "Cross-site scripting"
+        if "path" in categories:
+            return "Path traversal / file disclosure"
         value = label.lower()
         if any(token in value for token in {"admin", "grant", "assumerole", "iam.put", "setrole"}):
             return "Auth bypass / privilege escalation"

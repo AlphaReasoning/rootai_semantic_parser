@@ -6,6 +6,7 @@ import fnmatch
 import functools
 import hashlib
 import json
+from collections import defaultdict
 import logging
 import os
 import subprocess
@@ -17,7 +18,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from analyzers.symbols import SymbolResolver
 from analyzers.taint import TaintAnalyzer
-from models import AnalysisOptions, Edge, LogicClass, Node, ScanReport, SecurityConfig, TaintConfig
+from models import AnalysisOptions, Edge, EdgeRelation, LogicClass, Node, ScanReport, SecurityConfig, TaintConfig
 from parsers.registry import iter_parser_classes
 from version import __version__
 
@@ -193,6 +194,116 @@ def _config_cache_key(config: SecurityConfig) -> Dict[str, Any]:
         value = getattr(config, field_def.name)
         key[field_def.name] = sorted(value) if isinstance(value, (set, frozenset)) else value
     return key
+
+
+class CrossFileCallResolver:
+    """Connect synthetic call targets to functions declared in other files.
+
+    Parsing is per file, so a call resolves only against declarations in that
+    same file. Real code puts the handler and the routine it calls in different
+    files -- a route calling into a service or DAO -- and without this pass the
+    taint path stops at the file boundary.
+
+    Uses the same conservative rule as the per-file resolver: a name is resolved
+    only when exactly one function in the entire scan declares it, so common
+    method names shared by many types are left alone rather than merged.
+    """
+
+    def __init__(self, graph: Dict) -> None:
+        self.graph = graph
+        self.nodes: Dict[str, Dict] = {n["id"]: n for n in graph.get("nodes", [])}
+
+    def run(self) -> int:
+        declarations: Dict[Tuple[str, str], List[str]] = {}
+        for node in self.graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            name = metadata.get("declares")
+            if not name or metadata.get("synthetic"):
+                continue
+            declarations.setdefault((node.get("language", ""), name), []).append(node["id"])
+
+        # Argument edges grouped by the stub they feed, keyed on position.
+        arguments: Dict[str, Dict[int, str]] = defaultdict(dict)
+        for edge in self.graph.get("edges", []):
+            metadata = edge.get("metadata") or {}
+            if metadata.get("flow_kind") == "call_argument" and "arg_index" in metadata:
+                arguments[edge["target"]][int(metadata["arg_index"])] = edge["source"]
+
+        existing = {
+            (e["source"], e["target"], e["relation"]) for e in self.graph.get("edges", [])
+        }
+        added = 0
+        for node in self.graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            if metadata.get("synthetic") != "call_target":
+                continue
+            short_name = metadata.get("callee_short")
+            if not short_name:
+                continue
+            candidates = declarations.get((node.get("language", ""), short_name)) or []
+            if len(candidates) != 1:
+                continue
+            target = candidates[0]
+            if target == node["id"]:
+                continue
+
+            key = (node["id"], target, EdgeRelation.CALLS.value)
+            if key not in existing:
+                self.graph["edges"].append(
+                    {
+                        "source": node["id"],
+                        "target": target,
+                        "relation": EdgeRelation.CALLS.value,
+                        "fragility_score": 0.5,
+                        "metadata": {"resolved": True, "cross_file": True, "call_name": short_name},
+                    }
+                )
+                existing.add(key)
+                added += 1
+
+            added += self._bind_arguments(node["id"], target, arguments, existing)
+
+        # Some parsers have their call edges rewritten to the declaration before
+        # this pass runs, so the arguments already point at the real function
+        # rather than a stub. Bind those directly.
+        for node in self.graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            if metadata.get("param_ids") and not metadata.get("synthetic"):
+                added += self._bind_arguments(node["id"], node["id"], arguments, existing)
+        return added
+
+    def _bind_arguments(
+        self,
+        call_site_id: str,
+        target_id: str,
+        arguments: Dict[str, Dict[int, str]],
+        existing: Set[Tuple[str, str, str]],
+    ) -> int:
+        """Link each argument at ``call_site_id`` to the parameter it becomes."""
+        param_ids = (self.nodes.get(target_id, {}).get("metadata") or {}).get("param_ids") or []
+        added = 0
+        for position, argument_id in arguments.get(call_site_id, {}).items():
+            if position >= len(param_ids):
+                continue
+            key = (argument_id, param_ids[position], EdgeRelation.DATAFLOW.value)
+            if key in existing or argument_id == param_ids[position]:
+                continue
+            self.graph["edges"].append(
+                {
+                    "source": argument_id,
+                    "target": param_ids[position],
+                    "relation": EdgeRelation.DATAFLOW.value,
+                    "fragility_score": 0.5,
+                    "metadata": {
+                        "flow_kind": "argument_binding",
+                        "cross_file": True,
+                        "position": position,
+                    },
+                }
+            )
+            existing.add(key)
+            added += 1
+        return added
 
 
 class ParseCache:
@@ -447,6 +558,13 @@ class MultiFileParser:
             ),
         }
         resolved = SymbolResolver(graph).run()
+        cross_file_edges = CrossFileCallResolver(resolved).run()
+        if cross_file_edges:
+            self._emit(
+                "graph",
+                "Resolved calls into declarations in other files.",
+                cross_file_edges=cross_file_edges,
+            )
         self._emit(
             "graph",
             "Graph merge and symbol resolution complete.",

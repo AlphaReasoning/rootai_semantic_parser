@@ -79,7 +79,7 @@ That path shows the repo intake, visible machine workflow, semantic reasoning, a
 - **Formal semantic IR:** versioned node taxonomy, edge ontology, and explicit soundness/completeness boundaries
 - **Deterministic graph queries:** BFS, DFS, shortest path, reachability cones, SCCs, and degree centrality without LLM path computation
 - **Semantic graph construction:** nodes and edges representing structure, imports, relationships, and flow
-- **Taint analysis:** multi-hop defensive source-to-sink tracing with severity and impact scoring
+- **Taint analysis:** inter-procedural and cross-file. A source in one function reaching a sink in another — or in another file — is detected in every supported language. Data flows through arguments and return values only; call edges and declaration edges are treated as control flow, so a value in a function does not implicate everything that function invokes. Impact is classified per class (RCE, SQL/NoSQL injection, SSRF, XSS, memory corruption, path traversal, deserialization)
 - **Operator controls:** profiles, quick mode, cache control, reachability heuristics, auth heuristics, exclusions
 - **Power inputs:** custom config, custom finding profile, ruleset extension, suppressions, baseline, feedback DB, CVE feed, external graph snapshots
 - **Operator exports:** raw JSON, Markdown, HTML, SARIF, CI annotations, PoC helper payloads, submission drafts

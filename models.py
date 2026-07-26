@@ -285,7 +285,8 @@ class TaintConfig:
             "unsafe",
             "innerHTML",
             "subprocess.run",
-            "cursor.execute",
+            "cursor.execute", "cur.execute", "conn.execute", "connection.execute",
+            "session.execute", "stmt.execute", "statement.execute",
             "exec",
             "compile",
             "pickle.loads",
@@ -314,6 +315,22 @@ class TaintConfig:
             "eval.parse", "parse.text",
             "delegatecall", "callcode", "selfdestruct",
             "NSTask", "objc_msgSend",
+            # --- SSRF ---
+            "needle.get", "needle.post", "axios.get", "axios.post", "http.get",
+            "https.get", "requests.get", "requests.post", "urlopen",
+            "HttpClient.GetAsync", "RestTemplate", "URLConnection",
+            # --- NoSQL / SQL injection ---
+            "collection.find", "collection.findOne", "collection.update",
+            "collection.remove", "collection.insert", "db.collection",
+            "createQuery", "prepareStatement", "rawQuery", "knex.raw",
+            # --- Cross-site scripting ---
+            "res.write", "res.send", "dangerouslySetInnerHTML", "outerHTML",
+            "insertAdjacentHTML", "v-html",
+            # --- Path traversal / file disclosure ---
+            "fs.readFile", "fs.readFileSync", "fs.createReadStream",
+            "sendFile", "res.download", "FileInputStream", "File.ReadAllText",
+            # --- Template injection ---
+            "render_template_string", "Template", "compile_template",
             # --- IR v0.3.0: C sinks ---
             "system",
             "popen",
