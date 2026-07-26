@@ -8,7 +8,18 @@ PARSER_PLUGINS: List[Type[object]] = []
 
 
 def register_parser(parser_cls: Type[object]) -> None:
-    """Register a custom parser class if it is not already loaded."""
+    """Register a custom parser class if it is not already loaded.
+
+    A callable ``supports`` is required up front because ``MultiFileParser``
+    invokes it on every registered class for every candidate file. Without this
+    check a malformed plugin surfaces as an AttributeError from deep inside a
+    scan, long after the faulty registration.
+    """
+    if not callable(getattr(parser_cls, "supports", None)):
+        raise TypeError(
+            f"{parser_cls!r} cannot be registered as a parser: "
+            "it does not provide a callable supports()"
+        )
     if parser_cls not in PARSER_PLUGINS:
         PARSER_PLUGINS.append(parser_cls)
 

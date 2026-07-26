@@ -97,24 +97,13 @@ def test_supports_only_rust_extension() -> None:
 
 
 def test_rust_parser_is_registered_for_dispatch() -> None:
-    """MultiFileParser can reach a Rust parser through the shared registry.
+    """MultiFileParser can reach RustParser through the shared registry."""
+    registered = list(iter_parser_classes())
+    assert RustParser in registered, [cls.__name__ for cls in registered]
+    assert [cls.__name__ for cls in registered].count("RustParser") == 1
 
-    Compared by name rather than identity: the ``rootai_semantic_parser`` compat
-    shim re-executes module files when they are imported through the alias path,
-    so two equivalent RustParser class objects can coexist.
-    """
-    registered = [cls for cls in iter_parser_classes() if cls.__name__ == "RustParser"]
-    assert registered, [cls.__name__ for cls in iter_parser_classes()]
-    assert all(cls.supports("src/lib.rs") for cls in registered)
-
-    # No built-in parser may also claim .rs, or dispatch order would decide the winner.
-    # Only classes exposing supports() are consulted: tests/unit/test_plugins.py leaks a
-    # supports-less DummyParser into the process-global PARSER_PLUGINS.
-    others = [
-        cls
-        for cls in iter_parser_classes()
-        if cls.__name__ != "RustParser" and callable(getattr(cls, "supports", None))
-    ]
+    # No other parser may claim .rs, or dispatch order would decide the winner.
+    others = [cls for cls in registered if cls is not RustParser]
     assert not [cls for cls in others if cls.supports("src/lib.rs")]
 
 

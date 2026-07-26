@@ -92,19 +92,13 @@ def test_supports_c_sources_and_headers() -> None:
 
 
 def test_c_parser_is_registered_for_dispatch() -> None:
-    """Compared by name; the compat shim can yield equivalent duplicate classes."""
-    registered = [cls for cls in iter_parser_classes() if cls.__name__ == "CParser"]
-    assert registered, [cls.__name__ for cls in iter_parser_classes()]
-    assert all(cls.supports("src/net.c") and cls.supports("include/net.h") for cls in registered)
+    """MultiFileParser can reach CParser through the shared registry."""
+    registered = list(iter_parser_classes())
+    assert CParser in registered, [cls.__name__ for cls in registered]
+    assert [cls.__name__ for cls in registered].count("CParser") == 1
 
     # No other parser may claim .c/.h, or dispatch order would decide the winner.
-    # Only classes exposing supports() are consulted: tests/unit/test_plugins.py leaks a
-    # supports-less DummyParser into the process-global PARSER_PLUGINS.
-    others = [
-        cls
-        for cls in iter_parser_classes()
-        if cls.__name__ != "CParser" and callable(getattr(cls, "supports", None))
-    ]
+    others = [cls for cls in registered if cls is not CParser]
     assert not [cls for cls in others if cls.supports("src/net.c") or cls.supports("include/net.h")]
 
 
