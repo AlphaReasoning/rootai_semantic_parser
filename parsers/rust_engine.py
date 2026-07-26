@@ -164,6 +164,15 @@ class RustParser(TreeSitterParser):
         # Crate name inferred from directory structure (best-effort).
         self._crate_name: str = "unknown"
 
+        # Imported short name -> fully-qualified path, e.g. Command ->
+        # std::process::Command. Taint patterns are written in full form but call
+        # sites use the short name, so without this they never match.
+        self._use_aliases: Dict[str, str] = {}
+
+        # (enclosing_function_id, variable name) -> node id, so a call argument
+        # can be resolved back to the binding it refers to.
+        self._value_nodes: Dict[Tuple[str, str], str] = {}
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -201,6 +210,8 @@ class RustParser(TreeSitterParser):
         # Reset per-file state so this instance can be safely re-used across
         # multiple files (though MultiFileParser creates a fresh instance each time).
         self._ssa = SSAVersionTracker()
+        self._use_aliases = {}
+        self._value_nodes = {}
         self._lifetime_registry = {}
         self._borrow_stack = []
         self._unsafe_stack = []
@@ -558,6 +569,8 @@ class RustParser(TreeSitterParser):
         module_path = use_text.removeprefix("use ").rstrip(";").strip()
         import_name = module_path.split("::")[-1].strip("{}").strip()
 
+        self._record_use_aliases(module_path)
+
         imp_id = self._make_id(path, f"__use__{module_path}")
         imp_node = self._make_node(
             imp_id,
@@ -680,6 +693,7 @@ class RustParser(TreeSitterParser):
                 )
             )
             self._ownership_map[ssa_label] = ownership
+            self._value_nodes[(fn_id, param_name)] = var_id
 
             # If this is a reference parameter, emit a BORROWS edge from param → fn.
             if ownership in (_OWN_SHARED_REF, _OWN_MUT_REF):
@@ -966,12 +980,17 @@ class RustParser(TreeSitterParser):
                 "ssa_version": int(ssa_label.split("_v")[-1]) if "_v" in ssa_label else 0,
                 "type_str": type_str,
                 "flow_kind": "let_binding",
+                # Recorded separately from is_unsafe: this says the value is
+                # externally controlled, whereas is_unsafe below also covers raw
+                # pointers, which are a memory-safety signal only.
+                "is_taint_source": is_taint_source,
             }
         )
         if is_unsafe_ptr or is_taint_source:
             var_node.is_unsafe = True
 
         self.nodes[var_id] = var_node
+        self._value_nodes[(fn_id, var_name)] = var_id
 
         # DATAFLOW/MOVES edge from enclosing function → variable.
         rel = EdgeRelation.MOVES if found_eq else EdgeRelation.DATAFLOW
@@ -1176,13 +1195,17 @@ class RustParser(TreeSitterParser):
         callee_short = callee.split("::")[-1]
         lineno = node.start_point[0] + 1
 
+        # Match against the fully-qualified form as well: taint patterns are
+        # written as `std::process::Command`, but the call site says `Command::new`.
+        resolved_callee = self._resolve_use_path(callee)
+
         tc = self.config.to_taint_config()
         is_source = any(
-            src_kw in callee or src_kw in callee_short
+            src_kw in callee or src_kw in callee_short or src_kw in resolved_callee
             for src_kw in tc.sources
         )
         is_sink = any(
-            sink_kw in callee or sink_kw in callee_short
+            sink_kw in callee or sink_kw in callee_short or sink_kw in resolved_callee
             for sink_kw in tc.sinks
         ) or callee in _UNSAFE_SINK_LABELS
 
@@ -1226,35 +1249,77 @@ class RustParser(TreeSitterParser):
                 )
             )
 
-        # Fix 1 part B: for sink calls, walk the arguments node and emit
-        # DATAFLOW edges from each identifier argument → callee_stub.
-        # This gives TaintAnalyzer the path: source_var → callee_sink.
-        if is_sink and len(node.children) > 1:
-            args_node = node.children[-1] if node.children else None
-            if args_node and args_node.type == "arguments":
-                for arg in args_node.children:
-                    if arg.type in ("identifier", "scoped_identifier"):
-                        arg_text = self._get_text(src, arg)
-                        ssa_current = self._ssa.get_current_id(arg_text)
-                        arg_var_id_candidate = self._make_id(
-                            path, f"{fn_id}::let::{ssa_current}"
-                        ) if ssa_current else None
-                        arg_source_id = arg_var_id_candidate if (
-                            arg_var_id_candidate and arg_var_id_candidate in self.nodes
-                        ) else None
-                        # Also try parent_id directly when called from _visit_let.
-                        if arg_source_id is None and parent_id in self.nodes:
-                            arg_source_id = parent_id
-                        if arg_source_id:
-                            self.edges.append(
-                                self._edge(
-                                    arg_source_id,
-                                    callee_id,
-                                    EdgeRelation.DATAFLOW,
-                                    {"flow_kind": "arg_to_sink", "call_name": callee},
-                                )
-                            )
+        # Link the bindings this call reads into the callee. Done for every call,
+        # not just sinks: an intermediate call is how a multi-hop path stays
+        # connected, and restricting it to sinks truncated every chain at its
+        # first non-sink step.
+        self._link_call_arguments(node, src, path, fn_id, callee_id, callee)
 
+
+    def _record_use_aliases(self, module_path: str) -> None:
+        """Map each name introduced by a ``use`` to its fully-qualified path."""
+        if "{" in module_path:
+            prefix, _, group = module_path.partition("{")
+            prefix = prefix.rstrip(": ").strip()
+            for member in group.rstrip("}").split(","):
+                member = member.strip()
+                if not member or member == "self":
+                    continue
+                short = member.split("::")[-1].strip()
+                if short and short != "*":
+                    self._use_aliases[short] = f"{prefix}::{member}" if prefix else member
+            return
+        short = module_path.split("::")[-1].strip()
+        if short and short != "*":
+            self._use_aliases[short] = module_path
+
+    def _resolve_use_path(self, callee: str) -> str:
+        """Expand an imported short name back to its fully-qualified path.
+
+        ``Command::new`` becomes ``std::process::Command::new`` given
+        ``use std::process::Command``, which is what the configured sink patterns
+        are written against.
+        """
+        head, sep, rest = callee.partition("::")
+        full = self._use_aliases.get(head.strip())
+        return f"{full}{sep}{rest}" if full else callee
+
+    def _link_call_arguments(
+        self,
+        node,
+        src: str,
+        path: str,
+        fn_id: str,
+        callee_id: str,
+        callee: str,
+    ) -> None:
+        """Link every binding mentioned inside a call expression into the callee.
+
+        Rust call syntax nests: in ``Command::new(&cmd).output()`` the argument
+        ``cmd`` sits inside the *callee* expression of the outer call, not in its
+        argument list, and arguments may be ``&x``, ``&mut x`` or ``x.field``.
+        Scanning the whole call subtree for identifiers that resolve to a known
+        binding catches all of those shapes without modelling each one.
+        """
+        seen: Set[str] = set()
+        for descendant in self._iter_descendants(node):
+            if descendant.type != _TS_IDENTIFIER:
+                continue
+            name = self._get_text(src, descendant).strip()
+            if not name or name in seen:
+                continue
+            value_id = self._value_nodes.get((fn_id, name))
+            if value_id is None or value_id not in self.nodes:
+                continue
+            seen.add(name)
+            self.edges.append(
+                self._edge(
+                    value_id,
+                    callee_id,
+                    EdgeRelation.DATAFLOW,
+                    {"flow_kind": "call_argument", "call_name": callee},
+                )
+            )
 
     def _visit_method_call(
         self,

@@ -49,18 +49,94 @@ class TaintAnalyzer:
         self._node_idx: Dict[str, Dict] = {n["id"]: n for n in graph.get("nodes", [])}
         self._adj: Dict[str, List[Tuple[str, str, float]]] = defaultdict(list)
         for edge in graph.get("edges", []):
-            if edge["relation"] in (EdgeRelation.DATAFLOW.value, EdgeRelation.CALLS.value):
-                self._adj[edge["source"]].append(
-                    (edge["target"], edge["relation"], float(edge.get("fragility_score", 0.5)))
-                )
+            for source, target, relation, weight in self._propagations(edge):
+                self._adj[source].append((target, relation, weight))
         self._parent: Dict[Tuple[str, FrozenSet[str]], Tuple[str, FrozenSet[str]]] = {}
         self._best_score: Dict[Tuple[str, FrozenSet[str]], float] = {}
         self._hop_count: Dict[Tuple[str, FrozenSet[str]], int] = {}
         self._fragility_sum: Dict[Tuple[str, FrozenSet[str]], float] = {}
 
+    @staticmethod
+    def _propagations(edge: Dict) -> List[Tuple[str, str, str, float]]:
+        """Return the taint propagations implied by one graph edge.
+
+        Yields ``(source, target, relation, weight)``. An edge can imply flow in
+        the reverse direction, or none at all; only relations that actually carry
+        a *value* belong here. ``contains``/``imports``/``inherits`` are structural,
+        ``drops``/``lifetime_bounds`` describe object lifetime rather than data,
+        and ``moves`` as emitted links a function to the local it declares (a
+        binding record, not a value transfer), so all of them are excluded.
+        """
+        relation = edge.get("relation")
+        src, tgt = edge["source"], edge["target"]
+        weight = float(edge.get("fragility_score", 0.5))
+        metadata = edge.get("metadata") or {}
+
+        if relation == EdgeRelation.CALLS.value:
+            return [(src, tgt, relation, weight)]
+
+        if relation == EdgeRelation.DATAFLOW.value:
+            # A parameter edge runs function -> parameter, which is a binding
+            # record. The value flows the other way: a tainted argument makes the
+            # receiving function operate on tainted data, and the function's own
+            # call-argument edges carry that onward to its callees.
+            if metadata.get("flow_kind") == "parameter":
+                return [(tgt, src, relation, weight)]
+            return [(src, tgt, relation, weight)]
+
+        if relation == EdgeRelation.FIELD_ACCESS.value:
+            # Aggregate -> field. Taint flows both ways: a tainted struct yields
+            # tainted members, and a tainted member makes the aggregate carry
+            # tainted data. Down-weighted because it is field-insensitive.
+            return [
+                (src, tgt, relation, weight * 0.5),
+                (tgt, src, relation, weight * 0.5),
+            ]
+
+        if relation in (
+            EdgeRelation.UNSAFE_DEREFERENCE.value,
+            EdgeRelation.POINTER_ARITH.value,
+            EdgeRelation.BORROWS.value,
+            EdgeRelation.MACRO_EXPANDS_TO.value,
+        ):
+            # Reading through a pointer, deriving a pointer, lending a reference
+            # and expanding a macro all carry the underlying value forward.
+            return [(src, tgt, relation, weight)]
+
+        return []
+
     def _matches(self, node: Dict, keyword_set: Set[str]) -> bool:
         label = node.get("label", "").lower()
         return any(kw.lower() in label for kw in keyword_set)
+
+    def _is_taint_source(self, node: Dict) -> bool:
+        """Return whether a node introduces externally controlled data.
+
+        ``is_unsafe`` deliberately does not qualify. The parsers set it for
+        memory-unsafe *constructs* -- every pointer parameter, every dangerous
+        sink -- which is a severity signal, not a statement about attacker
+        control. Seeding from it made every pointer-taking C function a taint
+        source and made each sink its own source, producing ``system -> system``
+        style self-loops.
+        """
+        if self._matches(node, self.config.sources):
+            return True
+        metadata = node.get("metadata") or {}
+        return bool(metadata.get("is_taint_source") or metadata.get("tainted_by"))
+
+    def _is_taint_sink(self, node: Dict) -> bool:
+        """Return whether a node is a dangerous operation.
+
+        Label matching alone is not enough. A parser may know a call is a sink
+        through information the label does not carry -- Rust resolves
+        ``Command::new`` to ``std::process::Command`` via its ``use`` statements,
+        but the node's label remains the source text. Where a parser has already
+        made that determination, honour it.
+        """
+        if self._matches(node, self.config.sinks):
+            return True
+        metadata = node.get("metadata") or {}
+        return bool(metadata.get("is_taint_sink"))
 
     @staticmethod
     def _sink_categories(label: str) -> Set[str]:
@@ -209,19 +285,25 @@ class TaintAnalyzer:
 
     def run(self) -> List[TaintPath]:
         """Compute ranked taint paths."""
-        queue: List[Tuple[float, int, str, FrozenSet[str]]] = []
-        for nid, node in self._node_idx.items():
-            if self._matches(node, self.config.sources) or node.get("is_unsafe"):
+        # Queue entries carry the sanitizer set as a *sorted tuple*. heapq falls
+        # through to comparing later tuple elements when the score and hop count
+        # tie, and ``<`` on frozensets is subset containment rather than a total
+        # order, which left equally scored paths ordered arbitrarily.
+        queue: List[Tuple[float, int, str, Tuple[str, ...]]] = []
+        for nid in sorted(self._node_idx):
+            node = self._node_idx[nid]
+            if self._is_taint_source(node):
                 self.tainted_nodes.add(nid)
                 state = (nid, frozenset())
                 self._parent[state] = state
                 self._best_score[state] = 0.0
                 self._hop_count[state] = 0
                 self._fragility_sum[state] = 0.0
-                heapq.heappush(queue, (-0.0, 0, nid, frozenset()))
+                heapq.heappush(queue, (-0.0, 0, nid, ()))
 
         while queue:
-            neg_score, hops, current, sanitizer_categories = heapq.heappop(queue)
+            neg_score, hops, current, sanitizer_key = heapq.heappop(queue)
+            sanitizer_categories = frozenset(sanitizer_key)
             current_score = -neg_score
             state = (current, sanitizer_categories)
             if current_score < self._best_score.get(state, float("-inf")) or hops > self._hop_count.get(state, hops):
@@ -249,18 +331,37 @@ class TaintAnalyzer:
                 self._best_score[next_state] = next_score
                 self._hop_count[next_state] = next_hops
                 self._fragility_sum[next_state] = next_fragility
-                heapq.heappush(queue, (-next_score, next_hops, neighbor, next_categories))
+                heapq.heappush(
+                    queue,
+                    (-next_score, next_hops, neighbor, tuple(sorted(next_categories))),
+                )
 
-        for nid in self.tainted_nodes:
+        # Sorted so that findings do not depend on set iteration order, which
+        # varies between processes under randomized string hashing.
+        for nid in sorted(self.tainted_nodes):
             node = self._node_idx.get(nid)
-            if node and self._matches(node, self.config.sinks):
+            if node and self._is_taint_sink(node):
                 sink_states = [(state, score) for state, score in self._best_score.items() if state[0] == nid]
                 if not sink_states:
                     continue
-                best_state, _ = max(sink_states, key=lambda item: (item[1], -self._hop_count.get(item[0], 0)))
+                # Ties broken on the sanitizer set so one route is chosen
+                # reproducibly when several score identically.
+                best_state, _ = max(
+                    sink_states,
+                    key=lambda item: (
+                        item[1],
+                        -self._hop_count.get(item[0], 0),
+                        tuple(sorted(item[0][1])),
+                    ),
+                )
                 sanitizer_categories = best_state[1]
                 sanitized = self._effective_sanitized(sanitizer_categories, node.get("label", ""))
                 path = self._reconstruct(best_state)
+                if len(path) < 2 or path[0] == path[-1]:
+                    # A node that matches both a source and a sink pattern is not
+                    # evidence of a flow; it is one label satisfying two keyword
+                    # sets. Reporting it produced findings like "system -> system".
+                    continue
                 severity = "critical" if self._matches(node, self.config.critical_sinks) else "high"
                 if sanitized and severity != "critical":
                     severity = "medium"

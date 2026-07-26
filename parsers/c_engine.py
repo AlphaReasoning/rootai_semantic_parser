@@ -129,6 +129,43 @@ _FORMAT_STRING_SINKS: Set[str] = {
     "scanf", "fscanf", "sscanf",
 }
 
+# Functions that read externally controlled data into a caller-supplied buffer.
+# Maps the callee to the argument positions that *receive* that data, so the
+# buffer -- not the call -- is what becomes tainted.
+_INPUT_BUFFER_ARGS: Dict[str, Tuple[int, ...]] = {
+    "read": (1,),
+    "recv": (1,),
+    "recvfrom": (1,),
+    "fgets": (0,),
+    "fread": (0,),
+    "gets": (0,),
+    "getline": (0,),
+    "readlink": (1,),
+}
+
+# Variadic scanners: every argument from the given index onward is an output.
+_INPUT_BUFFER_TAIL: Dict[str, int] = {"scanf": 1, "fscanf": 2, "sscanf": 2}
+
+# Copy-style functions, as (destination index, source indices). Taint is not
+# asserted here; an edge source_arg -> destination_arg is emitted so the
+# analyzer propagates only when a source argument is actually tainted.
+_COPY_DEST_FROM: Dict[str, Tuple[int, Tuple[int, ...]]] = {
+    "strcpy": (0, (1,)),
+    "strncpy": (0, (1,)),
+    "strcat": (0, (1,)),
+    "strncat": (0, (1,)),
+    "memcpy": (0, (1,)),
+    "memmove": (0, (1,)),
+    "stpcpy": (0, (1,)),
+    "sprintf": (0, (1, 2, 3, 4)),
+    "snprintf": (0, (2, 3, 4, 5)),
+    "strdup": (0, (0,)),
+}
+
+# Leading casts and address-of operators do not change which object a value
+# expression designates, so they are stripped before keying a value node.
+_RE_LEADING_CAST = re.compile(r"^\(\s*[A-Za-z_][\w\s\*]*\)\s*")
+
 
 class CParser(TreeSitterParser):
     """Tree-sitter backed parser for C source and header files.
@@ -170,6 +207,11 @@ class CParser(TreeSitterParser):
         # Whether the file being parsed is a header (declaration-only).
         self._is_header: bool = False
 
+        # Maps (enclosing_function_id, normalized value expression) -> node id,
+        # so the same storage referenced from different call sites resolves to a
+        # single node and taint can flow between those sites.
+        self._value_nodes: Dict[Tuple[str, str], str] = {}
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -208,6 +250,7 @@ class CParser(TreeSitterParser):
         self._translation_unit = path if not self._is_header else ""
 
         # Reset per-file state.
+        self._value_nodes = {}
         self._ssa = SSAVersionTracker()
         self._macro_registry = {}
         self._struct_layouts = {}
@@ -979,6 +1022,10 @@ class CParser(TreeSitterParser):
                     "array_size": self._extract_array_size(node, src),
                     "is_format_string_param": False,
                     "ssa_label": ssa_label,
+                    # Recorded separately from is_unsafe: this says the value is
+                    # externally controlled, whereas is_unsafe below also covers
+                    # plain pointers, which are a memory-safety signal only.
+                    "is_taint_source": is_taint_source,
                 }
             )
             if ptr_depth > 0 or is_taint_source:
@@ -995,6 +1042,7 @@ class CParser(TreeSitterParser):
             )
             # Correctly record pointer depth for pointer-arithmetic detection.
             self._pointer_depth_map[var_name] = ptr_depth
+            self._value_nodes[(parent_id, var_name)] = var_id
             if is_taint_source:
                 self.edges.append(
                     self._edge(
@@ -1124,20 +1172,152 @@ class CParser(TreeSitterParser):
                     )
                 )
 
-        # DATAFLOW edges for arguments that are known taint sources.
-        args = self._first_child(node, _TS_ARGUMENT_LIST)
-        if args:
-            for i, arg in enumerate(args.children):
-                if arg.type in (",", "(", ")"):
-                    continue
-                arg_text = self._get_text(src, arg)
-                if any(s in arg_text for s in self.config.to_taint_config().sources):
+        self._link_call_arguments(node, src, path, parent_id, callee_id, callee)
+
+    # ------------------------------------------------------------------
+    # Call-argument value modelling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _call_argument_nodes(node, _src: str) -> List[Tuple[int, Any]]:
+        """Return ``(index, ts_node)`` for each real argument, skipping punctuation."""
+        args = CParser._first_child(node, _TS_ARGUMENT_LIST)
+        if args is None:
+            return []
+        real: List[Tuple[int, Any]] = []
+        for child in args.children:
+            if child.type in (",", "(", ")") or child.type == _TS_COMMENT:
+                continue
+            real.append((len(real), child))
+        return real
+
+    @staticmethod
+    def _normalize_value_expr(text: str) -> str:
+        """Reduce an argument expression to the object it designates.
+
+        ``(char *)&ctx->buf`` and ``ctx->buf`` name the same storage as far as
+        taint is concerned, so both must key the same value node -- that identity
+        is what connects the call that fills a buffer to the call that reads it.
+        """
+        value = " ".join(text.split())
+        previous = None
+        while value != previous:
+            previous = value
+            value = _RE_LEADING_CAST.sub("", value).strip()
+            if value.startswith("&"):
+                value = value[1:].strip()
+        return value
+
+    def _argument_value_id(self, arg_node, src: str, path: str, fn_id: str) -> Optional[str]:
+        """Resolve an argument expression to a value node, creating one if needed.
+
+        Declared variables reuse their existing node; anything else (``c->buf``,
+        ``arr[i]``) gets a synthetic value node keyed per enclosing function, so
+        the same expression at different call sites is one node.
+        """
+        if arg_node.type in (_TS_STRING_LITERAL, _TS_NUMBER_LITERAL, _TS_CHAR_LITERAL):
+            return None
+        normalized = self._normalize_value_expr(self._get_text(src, arg_node))
+        if not normalized or normalized.isdigit():
+            return None
+
+        key = (fn_id, normalized)
+        existing = self._value_nodes.get(key)
+        if existing is not None:
+            return existing
+
+        value_id = self._make_id(path, f"{fn_id}::value::{normalized}")
+        if value_id not in self.nodes:
+            value_node = self._make_node(
+                value_id, NodeType.DATA, normalized, path, arg_node.start_point[0] + 1
+            )
+            value_node.metadata.update(
+                {
+                    "language": "c",
+                    "expression": normalized,
+                    "synthetic": "call_value",
+                    "translation_unit": self._translation_unit,
+                }
+            )
+            self.nodes[value_id] = value_node
+        self._value_nodes[key] = value_id
+        return value_id
+
+    def _link_call_arguments(
+        self,
+        node,
+        src: str,
+        path: str,
+        parent_id: str,
+        callee_id: str,
+        callee: str,
+    ) -> None:
+        """Wire argument values into the call, and back out of it where relevant."""
+        arguments = self._call_argument_nodes(node, src)
+        if not arguments:
+            return
+
+        resolved: Dict[int, str] = {}
+        for index, arg_node in arguments:
+            value_id = self._argument_value_id(arg_node, src, path, parent_id)
+            if value_id is None:
+                continue
+            resolved[index] = value_id
+            self.edges.append(
+                self._edge(
+                    value_id,
+                    callee_id,
+                    EdgeRelation.DATAFLOW,
+                    {
+                        "flow_kind": "call_argument",
+                        "arg_index": index,
+                        "call_name": callee,
+                    },
+                )
+            )
+
+        # Buffers filled with external input become taint sources themselves.
+        output_indices = set(_INPUT_BUFFER_ARGS.get(callee, ()))
+        tail_from = _INPUT_BUFFER_TAIL.get(callee)
+        if tail_from is not None:
+            output_indices.update(i for i in resolved if i >= tail_from)
+        for index in output_indices:
+            value_id = resolved.get(index)
+            if value_id is None:
+                continue
+            self.nodes[value_id].is_unsafe = True
+            self.nodes[value_id].metadata["is_taint_source"] = True
+            self.nodes[value_id].metadata["tainted_by"] = callee
+            self.edges.append(
+                self._edge(
+                    callee_id,
+                    value_id,
+                    EdgeRelation.DATAFLOW,
+                    {"flow_kind": "call_output", "arg_index": index, "call_name": callee},
+                )
+            )
+
+        # Copy-style calls move taint from their source arguments to their
+        # destination, without asserting that anything is tainted.
+        copy_spec = _COPY_DEST_FROM.get(callee)
+        if copy_spec:
+            dest_index, source_indices = copy_spec
+            dest_id = resolved.get(dest_index)
+            if dest_id is not None:
+                for source_index in source_indices:
+                    source_id = resolved.get(source_index)
+                    if source_id is None or source_id == dest_id:
+                        continue
                     self.edges.append(
                         self._edge(
-                            parent_id,
-                            callee_id,
+                            source_id,
+                            dest_id,
                             EdgeRelation.DATAFLOW,
-                            {"flow_kind": "call_argument", "arg_index": i, "arg_text": arg_text[:128]},
+                            {
+                                "flow_kind": "call_copy",
+                                "call_name": callee,
+                                "arg_index": source_index,
+                            },
                         )
                     )
 
@@ -1483,6 +1663,7 @@ class CParser(TreeSitterParser):
             )
         )
         self._pointer_depth_map[pname] = param["pointer_depth"]
+        self._value_nodes[(fn_id, pname)] = var_id
 
     # ------------------------------------------------------------------
     # Type extraction helpers

@@ -430,7 +430,22 @@ class MultiFileParser:
                     merged_edges[key] = GraphMerger.resolve_edge_conflict(merged_edges[key], edge)
                 else:
                     merged_edges[key] = asdict(edge)
-        graph = {"nodes": list(merged_nodes.values()), "edges": list(merged_edges.values())}
+        # Canonical ordering. Parsers are collected via as_completed(), so their
+        # arrival order -- and therefore the merged node and edge order -- varies
+        # between runs. Downstream consumers that break ties positionally (the
+        # taint search, report ranking) would otherwise produce different output
+        # for identical input.
+        graph = {
+            "nodes": sorted(merged_nodes.values(), key=lambda node: str(node.get("id", ""))),
+            "edges": sorted(
+                merged_edges.values(),
+                key=lambda edge: (
+                    str(edge.get("source", "")),
+                    str(edge.get("target", "")),
+                    str(edge.get("relation", "")),
+                ),
+            ),
+        }
         resolved = SymbolResolver(graph).run()
         self._emit(
             "graph",
