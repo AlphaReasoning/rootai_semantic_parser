@@ -38,6 +38,10 @@ def iter_parser_classes() -> Iterable[Type[object]]:
         CSharpParser, GoParser, JavaParser, JavaScriptParser,
         PHPParser, RubyParser, TSXParser, TypeScriptParser,
     )
+    from parsers.generic_engine import (
+        BashParser, CppParser, KotlinParser, LuaParser,
+        ObjCParser, RParser, ScalaParser, SwiftParser,
+    )
     from parsers.rust_engine import RustParser  # IR v0.3.0
     from parsers.c_engine import CParser        # IR v0.3.0
 
@@ -54,6 +58,15 @@ def iter_parser_classes() -> Iterable[Type[object]]:
         # --- IR v0.3.0 additions ---
         RustParser,
         CParser,
+        # --- broader language coverage ---
+        CppParser,
+        ObjCParser,
+        KotlinParser,
+        SwiftParser,
+        ScalaParser,
+        LuaParser,
+        RParser,
+        BashParser,
     ]
     ordered: List[Type[object]] = []
     for parser_cls in builtins + PARSER_PLUGINS:

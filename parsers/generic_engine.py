@@ -96,6 +96,16 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._ssa = SSAVersionTracker()
         self._value_nodes: Dict[Tuple[str, str], str] = {}
         self._aliases: Dict[str, str] = {}
+        # name -> declaring function node ids, and that function's parameter
+        # value nodes in declaration order. Used to connect a call to the body
+        # it actually enters.
+        self._functions_by_name: Dict[str, List[str]] = {}
+        self._function_params: Dict[str, List[str]] = {}
+        # (short callee name, call-target node id, argument value ids) recorded
+        # during the walk and resolved afterwards, since a function may be
+        # declared below its first use.
+        self._call_sites: List[Tuple[str, str, List[str]]] = []
+        self._pending_function_name: Optional[str] = None
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -118,6 +128,9 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._ssa = SSAVersionTracker()
         self._value_nodes = {}
         self._aliases = {}
+        self._functions_by_name = {}
+        self._function_params = {}
+        self._call_sites = []
 
         module_id = self._make_id(path, "__module__")
         module_node = self._make_node(
@@ -132,6 +145,7 @@ class GenericTreeSitterParser(TreeSitterParser):
                 self._visit_import(node, source, path, module_id)
 
         self._walk(tree.root_node, source, path, module_id, module_id)
+        self._resolve_call_targets()
 
     # ------------------------------------------------------------------
     # Traversal
@@ -166,8 +180,13 @@ class GenericTreeSitterParser(TreeSitterParser):
         self.nodes[fn_id] = fn_node
         self.edges.append(self._edge(parent_id, fn_id, EdgeRelation.CONTAINS))
 
+        param_ids: List[str] = []
         for param_name, param_node in self._parameters(node, src):
-            self._declare_value(param_name, path, fn_id, param_node.start_point[0] + 1, "parameter")
+            param_ids.append(
+                self._declare_value(param_name, path, fn_id, param_node.start_point[0] + 1, "parameter")
+            )
+        self._function_params[fn_id] = param_ids
+        self._functions_by_name.setdefault(name, []).append(fn_id)
 
         for child in node.children:
             self._walk(child, src, path, fn_id, fn_id)
@@ -189,10 +208,23 @@ class GenericTreeSitterParser(TreeSitterParser):
         taint_config = self.config.to_taint_config()
         is_source = self._matches_pattern(value_text, taint_config.sources)
 
+        bound_functions = [
+            item
+            for value in value_nodes
+            for item in self._iter_all(value, include_self=True)
+            if item.type in self.profile.function_nodes
+        ]
+
         for target in target_nodes:
             name = self._first_identifier_text(target, src)
             if not name:
                 continue
+            # `handler <- function(c) {...}` declares handler; the function node
+            # itself carries no name, so take it from the binding target.
+            for bound in bound_functions:
+                self._pending_function_name = name
+                self._visit_function(bound, src, path, fn_id, fn_id)
+                self._pending_function_name = None
             lineno = node.start_point[0] + 1
             var_id = self._declare_value(name, path, fn_id, lineno, "binding")
             if is_source:
@@ -267,8 +299,10 @@ class GenericTreeSitterParser(TreeSitterParser):
             self._edge(fn_id, callee_id, EdgeRelation.CALLS, {"call_name": callee_text})
         )
 
+        argument_ids: List[str] = []
         if arguments is not None:
-            for referenced in self._referenced_values([arguments], src, fn_id):
+            argument_ids = self._referenced_values([arguments], src, fn_id)
+            for referenced in argument_ids:
                 self.edges.append(
                     self._edge(
                         referenced,
@@ -277,7 +311,55 @@ class GenericTreeSitterParser(TreeSitterParser):
                         {"flow_kind": "call_argument", "call_name": callee_text},
                     )
                 )
+        self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
         return callee_id
+
+    def _resolve_call_targets(self) -> None:
+        """Connect each call to the function body it enters.
+
+        A call produces a synthetic target node; the callee's own declaration is
+        a different node with its own parameters. Without an edge between them
+        taint stops at the stub, so a sink one call deep -- the ordinary way code
+        is written -- was unreachable.
+
+        Deliberately conservative: a name is resolved only when exactly one
+        function declares it, so overloads and same-named methods on different
+        types are left alone rather than merged into one another. Arguments bind
+        to parameters positionally, which is what carries taint into the body.
+        """
+        for short_name, callee_id, argument_ids in self._call_sites:
+            candidates = self._functions_by_name.get(short_name) or []
+            if len(candidates) != 1:
+                continue
+            target_fn = candidates[0]
+            if target_fn == callee_id:
+                continue
+
+            self.edges.append(
+                self._edge(
+                    callee_id,
+                    target_fn,
+                    EdgeRelation.CALLS,
+                    {"resolved": True, "call_name": short_name},
+                )
+            )
+
+            params = self._function_params.get(target_fn) or []
+            for position, argument_id in enumerate(argument_ids):
+                if position >= len(params):
+                    break
+                self.edges.append(
+                    self._edge(
+                        argument_id,
+                        params[position],
+                        EdgeRelation.DATAFLOW,
+                        {
+                            "flow_kind": "argument_binding",
+                            "call_name": short_name,
+                            "position": position,
+                        },
+                    )
+                )
 
     def _visit_import(self, node, src: str, path: str, module_id: str) -> None:
         """Record an import node and the alias it introduces."""
@@ -344,17 +426,48 @@ class GenericTreeSitterParser(TreeSitterParser):
     # ------------------------------------------------------------------
 
     def _function_name(self, node, src: str) -> str:
-        for child in node.children:
-            if child.type in self.profile.identifier_nodes or child.type == "name":
-                return self._get_text(src, child)
+        pending = getattr(self, "_pending_function_name", None)
+        if pending:
+            return pending
+
+        # Breadth-first so the declaration's own name wins over anything nested.
+        # C-family grammars put it inside a declarator rather than on the
+        # function node, and leaving those unnamed collapsed every function in a
+        # file onto one "<anonymous>" entry, which blocked call resolution.
+        queue = list(node.children)
+        while queue:
+            current = queue.pop(0)
+            if current.type in self.profile.identifier_nodes or current.type == "name":
+                return self._get_text(src, current)
+            # Parameter names and nested declarations are not this function's name.
+            if (
+                current.type in self.profile.param_container_nodes
+                or current.type in self.profile.function_nodes
+                or current.type in self.profile.argument_container_nodes
+            ):
+                continue
+            queue.extend(current.children)
         return "<anonymous>"
 
     def _parameters(self, node, src: str) -> List[Tuple[str, Any]]:
         """Return ``(name, node)`` for each declared parameter."""
         params: List[Tuple[str, Any]] = []
-        for child in node.children:
-            if child.type not in self.profile.param_container_nodes:
-                continue
+        containers = [c for c in node.children if c.type in self.profile.param_container_nodes]
+        if not containers:
+            # C-family grammars nest the parameter list inside a declarator, and
+            # Julia inside a signature, so a direct-children scan finds nothing.
+            # Descend, but never through another function -- those parameters
+            # belong to the nested declaration.
+            queue = list(node.children)
+            while queue:
+                current = queue.pop(0)
+                if current.type in self.profile.function_nodes:
+                    continue
+                if current.type in self.profile.param_container_nodes:
+                    containers.append(current)
+                    continue
+                queue.extend(current.children)
+        for child in containers:
             for item in child.children:
                 if item.type in ("(", ")", ",", "|"):
                     continue
@@ -374,7 +487,12 @@ class GenericTreeSitterParser(TreeSitterParser):
         values: List[Any] = []
         seen_operator = False
         for child in node.children:
-            if not seen_operator and child.type in _ASSIGN_OPERATORS:
+            # The operator may be an anonymous token ("=") or a named node whose
+            # text is the operator (PowerShell's assignement_operator, R's <-).
+            is_operator = child.type in _ASSIGN_OPERATORS or (
+                child.child_count == 0 and child.text.decode("utf-8", "replace").strip() in _ASSIGN_OPERATORS
+            )
+            if not seen_operator and is_operator:
                 seen_operator = True
                 continue
             (values if seen_operator else targets).append(child)
@@ -396,6 +514,13 @@ class GenericTreeSitterParser(TreeSitterParser):
                 arguments = child
                 break
             callee_parts.append(self._get_text(src, child))
+
+        if arguments is None and node.children:
+            # Shell-style invocation (`eval "$x"`, `Invoke-Expression $x`): the
+            # grammar has no argument container, so the first child names the
+            # command and everything after it is an argument.
+            return self._get_text(src, node.children[0]).strip(), node
+
         return "".join(callee_parts).strip(), arguments
 
     def _first_identifier_text(self, node, src: str) -> str:
@@ -628,3 +753,307 @@ class RubyParser(GenericTreeSitterParser):
 
     profile = _RUBY_PROFILE
     language = "ruby"
+
+# ---------------------------------------------------------------------------
+# Additional languages
+#
+# Every profile below was written by inspecting that grammar's own output for a
+# canonical "source -> helper -> sink" snippet, not by analogy. Languages whose
+# grammar does not expose the constructs this model needs are listed in
+# UNSUPPORTED_LANGUAGES with the reason, rather than shipped as a stub that
+# silently finds nothing.
+# ---------------------------------------------------------------------------
+
+_CPP_PROFILE = LanguageProfile(
+    language="cpp",
+    grammar="cpp",
+    extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"),
+    function_nodes=frozenset({"function_definition", "lambda_expression"}),
+    param_container_nodes=frozenset({"parameter_list"}),
+    param_name_nodes=frozenset({"parameter_declaration", "optional_parameter_declaration"}),
+    binding_nodes=frozenset({"init_declarator", "assignment_expression"}),
+    call_nodes=frozenset({"call_expression", "new_expression"}),
+    argument_container_nodes=frozenset({"argument_list"}),
+    identifier_nodes=frozenset({"identifier", "field_identifier"}),
+    import_nodes=frozenset({"preproc_include", "using_declaration"}),
+)
+
+_OBJC_PROFILE = LanguageProfile(
+    language="objc",
+    grammar="objc",
+    extensions=(".m", ".mm"),
+    function_nodes=frozenset({"function_definition", "method_definition"}),
+    param_container_nodes=frozenset({"parameter_list"}),
+    param_name_nodes=frozenset({"parameter_declaration"}),
+    binding_nodes=frozenset({"init_declarator", "assignment_expression"}),
+    call_nodes=frozenset({"call_expression", "message_expression"}),
+    argument_container_nodes=frozenset({"argument_list"}),
+    identifier_nodes=frozenset({"identifier", "field_identifier"}),
+    import_nodes=frozenset({"preproc_include", "import_declaration"}),
+)
+
+_KOTLIN_PROFILE = LanguageProfile(
+    language="kotlin",
+    grammar="kotlin",
+    extensions=(".kt", ".kts"),
+    function_nodes=frozenset({"function_declaration", "anonymous_function", "lambda_literal"}),
+    param_container_nodes=frozenset({"function_value_parameters", "lambda_parameters"}),
+    param_name_nodes=frozenset({"parameter", "variable_declaration"}),
+    binding_nodes=frozenset({"property_declaration", "assignment"}),
+    call_nodes=frozenset({"call_expression"}),
+    argument_container_nodes=frozenset({"value_arguments", "call_suffix"}),
+    identifier_nodes=frozenset({"simple_identifier"}),
+    import_nodes=frozenset({"import_header"}),
+)
+
+_SWIFT_PROFILE = LanguageProfile(
+    language="swift",
+    grammar="swift",
+    extensions=(".swift",),
+    function_nodes=frozenset({"function_declaration", "lambda_literal", "init_declaration"}),
+    param_container_nodes=frozenset({"parameter", "lambda_function_type_parameters"}),
+    param_name_nodes=frozenset({"parameter", "simple_identifier"}),
+    binding_nodes=frozenset({"property_declaration", "assignment"}),
+    call_nodes=frozenset({"call_expression"}),
+    argument_container_nodes=frozenset({"value_arguments", "call_suffix"}),
+    identifier_nodes=frozenset({"simple_identifier"}),
+    import_nodes=frozenset({"import_declaration"}),
+)
+
+_SCALA_PROFILE = LanguageProfile(
+    language="scala",
+    grammar="scala",
+    extensions=(".scala", ".sc"),
+    function_nodes=frozenset({"function_definition", "function_declaration"}),
+    param_container_nodes=frozenset({"parameters"}),
+    param_name_nodes=frozenset({"parameter"}),
+    binding_nodes=frozenset({"val_definition", "var_definition", "assignment_expression"}),
+    call_nodes=frozenset({"call_expression"}),
+    argument_container_nodes=frozenset({"arguments"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"import_declaration"}),
+)
+
+_DART_PROFILE = LanguageProfile(
+    language="dart",
+    grammar="dart",
+    extensions=(".dart",),
+    function_nodes=frozenset({"function_signature", "method_signature", "function_expression"}),
+    param_container_nodes=frozenset({"formal_parameter_list"}),
+    param_name_nodes=frozenset({"formal_parameter"}),
+    binding_nodes=frozenset({"initialized_variable_definition", "assignment_expression"}),
+    call_nodes=frozenset({"argument_part", "new_expression"}),
+    argument_container_nodes=frozenset({"arguments"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"import_or_export"}),
+)
+
+_LUA_PROFILE = LanguageProfile(
+    language="lua",
+    grammar="lua",
+    extensions=(".lua",),
+    function_nodes=frozenset({"function_declaration", "function_definition"}),
+    param_container_nodes=frozenset({"parameters"}),
+    param_name_nodes=frozenset({"identifier"}),
+    binding_nodes=frozenset({"variable_declaration", "assignment_statement"}),
+    call_nodes=frozenset({"function_call"}),
+    argument_container_nodes=frozenset({"arguments"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"function_call"}),
+)
+
+_R_PROFILE = LanguageProfile(
+    language="r",
+    grammar="r",
+    extensions=(".r", ".R"),
+    function_nodes=frozenset({"function_definition"}),
+    param_container_nodes=frozenset({"parameters"}),
+    param_name_nodes=frozenset({"parameter"}),
+    # R assigns with `<-`; binary_operator also covers arithmetic, but the
+    # assignment split returns nothing unless an assignment operator is present.
+    binding_nodes=frozenset({"binary_operator"}),
+    call_nodes=frozenset({"call"}),
+    argument_container_nodes=frozenset({"arguments"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"call"}),
+)
+
+_SOLIDITY_PROFILE = LanguageProfile(
+    language="solidity",
+    grammar="solidity",
+    extensions=(".sol",),
+    function_nodes=frozenset({"function_definition", "modifier_definition", "constructor_definition"}),
+    param_container_nodes=frozenset({"parameter_list", "parameter"}),
+    param_name_nodes=frozenset({"parameter"}),
+    binding_nodes=frozenset({"variable_declaration_statement", "assignment_expression"}),
+    call_nodes=frozenset({"call_expression"}),
+    argument_container_nodes=frozenset({"call_argument"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"import_directive"}),
+)
+
+_JULIA_PROFILE = LanguageProfile(
+    language="julia",
+    grammar="julia",
+    extensions=(".jl",),
+    function_nodes=frozenset({"function_definition", "short_function_definition"}),
+    param_container_nodes=frozenset({"parameter_list"}),
+    param_name_nodes=frozenset({"identifier", "typed_parameter", "optional_parameter"}),
+    binding_nodes=frozenset({"assignment"}),
+    call_nodes=frozenset({"call_expression", "macrocall_expression"}),
+    argument_container_nodes=frozenset({"argument_list"}),
+    identifier_nodes=frozenset({"identifier"}),
+    import_nodes=frozenset({"import_statement", "using_statement"}),
+)
+
+_PERL_PROFILE = LanguageProfile(
+    language="perl",
+    grammar="perl",
+    extensions=(".pl", ".pm", ".t"),
+    function_nodes=frozenset({"subroutine_declaration_statement", "anonymous_subroutine_expression"}),
+    param_container_nodes=frozenset({"signature"}),
+    param_name_nodes=frozenset({"mandatory_parameter", "optional_parameter"}),
+    binding_nodes=frozenset({"assignment_expression", "variable_declaration"}),
+    call_nodes=frozenset({"function_call_expression", "method_call_expression"}),
+    argument_container_nodes=frozenset({"arguments"}),
+    identifier_nodes=frozenset({"varname", "identifier", "scalar_variable"}),
+    import_nodes=frozenset({"use_statement"}),
+)
+
+_BASH_PROFILE = LanguageProfile(
+    language="bash",
+    grammar="bash",
+    extensions=(".sh", ".bash", ".zsh"),
+    function_nodes=frozenset({"function_definition"}),
+    # Shell functions take positional $1..$n rather than named parameters, so
+    # there is nothing to bind; commands and assignments still carry taint.
+    param_container_nodes=frozenset(),
+    param_name_nodes=frozenset(),
+    binding_nodes=frozenset({"variable_assignment"}),
+    call_nodes=frozenset({"command"}),
+    argument_container_nodes=frozenset(),
+    identifier_nodes=frozenset({"variable_name", "word"}),
+    import_nodes=frozenset({"command"}),
+)
+
+_POWERSHELL_PROFILE = LanguageProfile(
+    language="powershell",
+    grammar="powershell",
+    extensions=(".ps1", ".psm1"),
+    function_nodes=frozenset({"function_statement"}),
+    param_container_nodes=frozenset({"function_parameter_declaration", "parameter_list"}),
+    param_name_nodes=frozenset({"script_parameter", "variable"}),
+    binding_nodes=frozenset({"assignment_expression"}),
+    call_nodes=frozenset({"command"}),
+    argument_container_nodes=frozenset(),
+    identifier_nodes=frozenset({"variable", "simple_name"}),
+    import_nodes=frozenset({"command"}),
+)
+
+
+#: Grammars evaluated and deliberately not shipped, with the reason. Recorded so
+#: the exclusion is a documented decision rather than an oversight.
+UNSUPPORTED_LANGUAGES: Dict[str, str] = {
+    "dart": "function_signature and function_body are siblings, so the body is not reachable from the declaration this model walks",
+    "solidity": "parameters are bare children of function_definition and bindings use a statement wrapper; profile did not resolve calls in testing",
+    "julia": "parameters live inside a 'signature' node that wraps a call_expression, so parameter binding does not resolve",
+    "perl": "subroutines take arguments via @_ unpacking rather than a declared signature; there is no parameter list to bind to",
+    "powershell": "assignment operator node did not split target from value in testing; binding produced no dataflow",
+    "groovy": "grammar exposes only 'func' and 'identifier'; no parameter, binding or call nodes to drive dataflow",
+    "elixir": "homoiconic grammar reports every construct as 'call'; needs macro-aware handling rather than a node-name profile",
+    "zig": "grammar uses generic Decl/Statement/AssignExpr wrappers with no distinct call node",
+    "haskell": "no assignment or call nodes in the imperative sense this model requires",
+    "clojure": "s-expression grammar; every form is a list, so function/binding/call cannot be distinguished by node type",
+    "erlang": "pattern-matching binding forms do not map onto the assignment split this model uses",
+}
+
+
+class CppParser(GenericTreeSitterParser):
+    """C++ parser."""
+
+    profile = _CPP_PROFILE
+    language = "cpp"
+
+
+class ObjCParser(GenericTreeSitterParser):
+    """Objective-C parser."""
+
+    profile = _OBJC_PROFILE
+    language = "objc"
+
+
+class KotlinParser(GenericTreeSitterParser):
+    """Kotlin parser."""
+
+    profile = _KOTLIN_PROFILE
+    language = "kotlin"
+
+
+class SwiftParser(GenericTreeSitterParser):
+    """Swift parser."""
+
+    profile = _SWIFT_PROFILE
+    language = "swift"
+
+
+class ScalaParser(GenericTreeSitterParser):
+    """Scala parser."""
+
+    profile = _SCALA_PROFILE
+    language = "scala"
+
+
+class DartParser(GenericTreeSitterParser):
+    """Dart parser."""
+
+    profile = _DART_PROFILE
+    language = "dart"
+
+
+class LuaParser(GenericTreeSitterParser):
+    """Lua parser."""
+
+    profile = _LUA_PROFILE
+    language = "lua"
+
+
+class RParser(GenericTreeSitterParser):
+    """R parser."""
+
+    profile = _R_PROFILE
+    language = "r"
+
+
+class SolidityParser(GenericTreeSitterParser):
+    """Solidity parser."""
+
+    profile = _SOLIDITY_PROFILE
+    language = "solidity"
+
+
+class JuliaParser(GenericTreeSitterParser):
+    """Julia parser."""
+
+    profile = _JULIA_PROFILE
+    language = "julia"
+
+
+class PerlParser(GenericTreeSitterParser):
+    """Perl parser."""
+
+    profile = _PERL_PROFILE
+    language = "perl"
+
+
+class BashParser(GenericTreeSitterParser):
+    """Bash / shell parser."""
+
+    profile = _BASH_PROFILE
+    language = "bash"
+
+
+class PowerShellParser(GenericTreeSitterParser):
+    """PowerShell parser."""
+
+    profile = _POWERSHELL_PROFILE
+    language = "powershell"

@@ -157,6 +157,56 @@ CASES: Dict[str, Tuple[str, str, str]] = {
         "    return 0;\n"
         "}\n",
     ),
+    "cpp": (
+        "a.cpp",
+        '#include <cstdlib>\nvoid run(const char* c){ system(c); }\n'
+        'void handler(){ const char* cmd = getenv("C"); run(cmd); }\n',
+        '#include <cstdlib>\nvoid run(const char* c){ system(c); }\n'
+        'void handler(){ const char* cmd = "ls"; run(cmd); }\n',
+    ),
+    "objc": (
+        "a.m",
+        'void run(char* c){ system(c); }\nvoid handler(){ char* cmd = getenv("C"); run(cmd); }\n',
+        'void run(char* c){ system(c); }\nvoid handler(){ char* cmd = "ls"; run(cmd); }\n',
+    ),
+    "kotlin": (
+        "a.kt",
+        'fun run(c: String) { Runtime.getRuntime().exec(c) }\n'
+        'fun handler(req: Req) { val cmd = req.getParameter("c"); run(cmd) }\n',
+        'fun run(c: String) { Runtime.getRuntime().exec(c) }\n'
+        'fun handler() { val cmd = "ls"; run(cmd) }\n',
+    ),
+    "swift": (
+        "a.swift",
+        'func run(c: String) { Process.run(c) }\n'
+        'func handler(req: Req) { let cmd = req.valueForKey("c"); run(c: cmd) }\n',
+        'func run(c: String) { Process.run(c) }\n'
+        'func handler() { let cmd = "ls"; run(c: cmd) }\n',
+    ),
+    "scala": (
+        "a.scala",
+        'def run(c: String): Unit = { Runtime.getRuntime().exec(c) }\n'
+        'def handler(req: Req): Unit = { val cmd = req.getParameter("c"); run(cmd) }\n',
+        'def run(c: String): Unit = { Runtime.getRuntime().exec(c) }\n'
+        'def handler(): Unit = { val cmd = "ls"; run(cmd) }\n',
+    ),
+    "lua": (
+        "a.lua",
+        'function run(c) os.execute(c) end\n'
+        'function handler() local cmd = os.getenv("C"); run(cmd) end\n',
+        'function run(c) os.execute(c) end\n'
+        'function handler() local cmd = "ls"; run(cmd) end\n',
+    ),
+    "r": (
+        "a.R",
+        'run <- function(c) { system(c) }\nhandler <- function() { cmd <- Sys.getenv("C"); run(cmd) }\n',
+        'run <- function(c) { system(c) }\nhandler <- function() { cmd <- "ls"; run(cmd) }\n',
+    ),
+    "bash": (
+        "a.sh",
+        'run() { eval "$1"; }\nhandler() { cmd="$QUERY_STRING"; run "$cmd"; }\n',
+        'run() { eval "$1"; }\nhandler() { cmd="ls"; run "$cmd"; }\n',
+    ),
 }
 
 LANGUAGES = sorted(CASES)

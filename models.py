@@ -258,6 +258,12 @@ class TaintConfig:
             "Environment.GetEnvironmentVariable",
             "_GET", "_POST", "_REQUEST", "_COOKIE", "_FILES", "_SERVER",
             "file_get_contents", "ARGV", "ENV",
+            # --- Additional language sources ---
+            "os.getenv", "Sys.getenv", "ENV", "env:",
+            "conn.params", "queryParameters", "getQueryParameter",
+            "QUERY_STRING", "commandArgs", "readLine", "STDIN",
+            "msg.sender", "msg.data", "tx.origin", "calldata",
+            "valueForKey", "URLQueryItem",
             # --- IR v0.3.0: C sources ---
             "fgets",
             "fread",
@@ -300,6 +306,14 @@ class TaintConfig:
             "Process.Start", "SqlCommand", "Assembly.Load",
             "shell_exec", "proc_open", "popen", "mysqli_query", "include", "require_once",
             "instance_eval", "Open3.capture3", "Kernel.system",
+            # --- Additional language sinks ---
+            "os.execute", "io.popen", "loadstring",
+            "Invoke-Expression", "iex", "Start-Process",
+            "System.cmd", "Process.run", "Process.start",
+            "Runtime.exec", "ProcessBuilder.start",
+            "eval.parse", "parse.text",
+            "delegatecall", "callcode", "selfdestruct",
+            "NSTask", "objc_msgSend",
             # --- IR v0.3.0: C sinks ---
             "system",
             "popen",
