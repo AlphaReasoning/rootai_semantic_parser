@@ -135,7 +135,17 @@ class TreeSitterParser(LanguageParser):
 
     @staticmethod
     def _get_text(code: str, node) -> str:
-        return code[node.start_byte : node.end_byte]
+        """Return the exact source text spanned by ``node``.
+
+        tree-sitter reports *byte* offsets. Slicing the decoded ``code`` str with
+        them silently corrupts every span after the first non-ASCII byte, so the
+        node's own byte payload is authoritative here; ``code`` is only used as a
+        fallback for trees parsed without retained source.
+        """
+        raw = getattr(node, "text", None)
+        if raw is not None:
+            return raw.decode("utf-8", errors="replace")
+        return code.encode("utf-8")[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
 def _mark_function_entrypoint(node: Node, name: str, metadata: Optional[Dict[str, Any]] = None) -> None:

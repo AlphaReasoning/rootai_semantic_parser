@@ -1,4 +1,4 @@
-﻿"""Small plugin registry for parser extensions."""
+"""Small plugin registry for parser extensions."""
 
 from __future__ import annotations
 
@@ -14,9 +14,20 @@ def register_parser(parser_cls: Type[object]) -> None:
 
 
 def iter_parser_classes() -> Iterable[Type[object]]:
-    """Yield built-in and plugin parser classes in registration order."""
-    # Prefixing with 'parsers.' so the RootAI core can find it from the root
-    from parsers.engines import CSharpParser, GoParser, JavaParser, JavaScriptParser, PHPParser, PythonParser, RubyParser
+    """Yield built-in and plugin parser classes in registration order.
+
+    IR v0.3.0 additions: RustParser (.rs) and CParser (.c, .h) are appended
+    after the existing seven targets.  Their file extensions have no overlap
+    with any prior parser's ``supports()`` check, so dispatch order is
+    irrelevant for correctness — placement at the end is defensive.
+    """
+    # Local imports prevent circular-import issues at module load time.
+    from parsers.engines import (
+        CSharpParser, GoParser, JavaParser, JavaScriptParser,
+        PHPParser, PythonParser, RubyParser,
+    )
+    from parsers.rust_engine import RustParser  # IR v0.3.0
+    from parsers.c_engine import CParser        # IR v0.3.0
 
     builtins: List[Type[object]] = [
         PythonParser,
@@ -26,6 +37,9 @@ def iter_parser_classes() -> Iterable[Type[object]]:
         PHPParser,
         RubyParser,
         CSharpParser,
+        # --- IR v0.3.0 additions ---
+        RustParser,
+        CParser,
     ]
     ordered: List[Type[object]] = []
     for parser_cls in builtins + PARSER_PLUGINS:

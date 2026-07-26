@@ -22,6 +22,15 @@ class NodeType(str, Enum):
     CONTROL = "ControlNode"
     DATA = "DataNode"
     MODULE_ND = "ModuleNode"
+    # --- IR v0.3.0: Rust extensions ---
+    LIFETIME = "Lifetime"           # Explicit lifetime annotation ('a, 'static, '_)
+    BORROW_SCOPE = "BorrowScope"    # NLL borrow region boundary
+    TRAIT_IMPL = "TraitImpl"        # impl Trait for Type block
+    # --- IR v0.3.0: Rust + C shared ---
+    MACRO_EXPANSION = "MacroExpansion"  # Macro call site (declarative/proc/C preprocessor)
+    # --- IR v0.3.0: C extensions ---
+    TYPEDEF = "Typedef"             # C typedef declaration
+    UNION_TYPE = "UnionType"        # C union declaration
 
     @classmethod
     def plumbing(cls) -> FrozenSet["NodeType"]:
@@ -42,6 +51,17 @@ class EdgeRelation(str, Enum):
     IMPLEMENTS = "implements"
     UNSAFE_ACCESS = "unsafe_access"
     INHERITS = "inherits"
+    # --- IR v0.3.0: Rust extensions ---
+    BORROWS = "borrows"                     # &T / &mut T creation: value → reference
+    LIFETIME_BOUNDS = "lifetime_bounds"     # Lifetime constraint 'a: 'b: longer → shorter
+    DROPS = "drops"                         # Value drop: scope_node → value_node
+    MOVES = "moves"                         # Ownership transfer: src_binding → dst_binding
+    # --- IR v0.3.0: Rust + C shared ---
+    UNSAFE_DEREFERENCE = "unsafe_deref"     # Raw pointer deref: pointer_var → value
+    MACRO_EXPANDS_TO = "macro_expands_to"   # Macro site → expanded AST node
+    FIELD_ACCESS = "field_access"           # Struct/union field: aggregate → field_var
+    # --- IR v0.3.0: C extensions ---
+    POINTER_ARITH = "pointer_arith"         # Pointer arithmetic: base_ptr → derived_ptr
 
 
 class LogicClass(str, Enum):
@@ -71,7 +91,7 @@ _LOGIC_RANK: Dict[str, int] = {
 }
 VALID_NODE_TYPES: FrozenSet[str] = frozenset(t.value for t in NodeType)
 VALID_EDGE_RELATIONS: FrozenSet[str] = frozenset(r.value for r in EdgeRelation)
-IR_VERSION = "0.2.0"
+IR_VERSION = "0.3.0"
 
 NODE_TYPE_SEMANTICS: Mapping[str, Dict[str, Any]] = {
     NodeType.MODULE.value: {
@@ -215,6 +235,28 @@ class TaintConfig:
             "req",
             "r.form",
             "r.args",
+            # --- IR v0.3.0: Rust sources ---
+            "std::env::var",
+            "std::env::args",
+            "std::io::stdin",
+            "hyper::Body::to_bytes",
+            "axum::extract::Json",
+            "axum::extract::Query",
+            "actix_web::web::Json",
+            "actix_web::web::Query",
+            "rocket::request::Form",
+            "warp::body::json",
+            "tokio::net::TcpStream",
+            # --- IR v0.3.0: C sources ---
+            "fgets",
+            "fread",
+            "read",
+            "recv",
+            "recvfrom",
+            "getenv",
+            "scanf",
+            "fscanf",
+            "sscanf",
         }
     )
     sinks: Set[str] = field(
@@ -231,6 +273,31 @@ class TaintConfig:
             "compile",
             "pickle.loads",
             "yaml.load",
+            # --- IR v0.3.0: Rust sinks ---
+            "std::process::Command",
+            "libc::system",
+            "std::mem::transmute",
+            "std::ptr::write",
+            "std::ptr::read",
+            "sqlx::query",
+            "rusqlite::Connection::execute",
+            # --- IR v0.3.0: C sinks ---
+            "system",
+            "popen",
+            "execl",
+            "execle",
+            "execlp",
+            "execv",
+            "execve",
+            "execvp",
+            "strcpy",
+            "strcat",
+            "sprintf",
+            "gets",
+            "printf",
+            "fprintf",
+            "dlopen",
+            "dlsym",
         }
     )
     sanitizers: Set[str] = field(
@@ -245,6 +312,15 @@ class TaintConfig:
             "bleach.clean",
             "re.escape",
             "shlex.quote",
+            # --- IR v0.3.0: Rust sanitizers ---
+            "html_escape::encode_text",
+            "percent_encoding::percent_encode",
+            # --- IR v0.3.0: C sanitizers ---
+            "strncpy",
+            "strncat",
+            "snprintf",
+            "strlcpy",
+            "strlcat",
         }
     )
     critical_sinks: Set[str] = field(
@@ -588,6 +664,30 @@ class SecurityConfig:
             write_functions={"write", "insert", "update", "put", "post"},
             read_only_functions={"get", "read", "fetch", "query", "list"},
             pii_variable_patterns={"PII", "Secret", "Token", "Pass"},
+        )
+
+    @classmethod
+    def default_rust(cls) -> "SecurityConfig":
+        """Return default Rust security semantics (memory safety + systems focus)."""
+        return cls(
+            stack="rust",
+            pii_functions={"password", "secret", "token", "key", "credential", "private"},
+            destructive_functions={"drop", "free", "dealloc", "delete", "remove", "clear"},
+            write_functions={"write", "write_all", "send", "insert", "push", "set", "store"},
+            read_only_functions={"read", "recv", "get", "fetch", "load", "peek", "iter"},
+            pii_variable_patterns={"_secret", "_key", "_pass", "_token", "_cred", "_priv"},
+        )
+
+    @classmethod
+    def default_c(cls) -> "SecurityConfig":
+        """Return default C security semantics (memory safety + systems focus)."""
+        return cls(
+            stack="c",
+            pii_functions={"password", "secret", "token", "key", "credential"},
+            destructive_functions={"free", "delete", "remove", "destroy", "release"},
+            write_functions={"write", "fwrite", "send", "fprintf", "sprintf", "strcpy", "memcpy"},
+            read_only_functions={"read", "fread", "recv", "fgets", "scanf", "getenv", "strlen"},
+            pii_variable_patterns={"_secret", "_key", "_pass", "_token", "_buf", "_ptr"},
         )
 
     @classmethod

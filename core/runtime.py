@@ -9,10 +9,11 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import time
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from analyzers.symbols import SymbolResolver
 from analyzers.taint import TaintAnalyzer
@@ -136,6 +137,64 @@ class GlobalDependencyResolver:
         return SymbolResolver(self.graph).run()
 
 
+# Modules whose code shapes a cached parse result but which own no parser class:
+# the node/edge schema, and the node-id / SSA helpers every parser builds on.
+_CACHE_RELEVANT_MODULES = ("models", "analyzers.symbols")
+
+
+def engine_fingerprint() -> str:
+    """Digest of the source files that determine what a parse produces.
+
+    ``ParseCache`` keys on this so that changing an engine invalidates graphs
+    cached by an earlier build. Without it a scan silently replays stale results:
+    the scanned files' mtimes are unchanged, so every entry still reports a hit
+    even though the code that produced it no longer exists.
+
+    File *contents* are hashed rather than mtimes, because a fresh checkout
+    rewrites mtimes without changing code, and a patch can change code while
+    preserving them. Registered parser classes are consulted through the registry
+    so that plugin parsers added via ``register_parser`` are covered too.
+    """
+    paths: Set[str] = set()
+    for parser_cls in iter_parser_classes():
+        module = sys.modules.get(getattr(parser_cls, "__module__", ""))
+        source = getattr(module, "__file__", None)
+        if source:
+            paths.add(source)
+    for module_name in _CACHE_RELEVANT_MODULES:
+        module = sys.modules.get(module_name)
+        source = getattr(module, "__file__", None)
+        if source:
+            paths.add(source)
+
+    digest = hashlib.sha256()
+    for source in sorted(paths):
+        digest.update(source.encode("utf-8"))
+        try:
+            with open(source, "rb") as handle:
+                digest.update(hashlib.sha256(handle.read()).digest())
+        except OSError:
+            # An unreadable source must not collapse the fingerprint onto the
+            # value it would have had if the file simply did not exist.
+            digest.update(b"\x00unreadable")
+    return digest.hexdigest()[:16]
+
+
+def _config_cache_key(config: SecurityConfig) -> Dict[str, Any]:
+    """Serialize every SecurityConfig field deterministically.
+
+    All of them reach a cached parse: the taint sets drive call-argument dataflow
+    edges, and the pii/logic sets drive ``Node.is_pii_sensitive`` and
+    ``Node.logic_class`` via ``classify_node``. Keying on the whole dataclass
+    avoids re-introducing the drift a hand-picked subset already suffered.
+    """
+    key: Dict[str, Any] = {}
+    for field_def in fields(config):
+        value = getattr(config, field_def.name)
+        key[field_def.name] = sorted(value) if isinstance(value, (set, frozenset)) else value
+    return key
+
+
 class ParseCache:
     """On-disk parse cache."""
 
@@ -147,11 +206,15 @@ class ParseCache:
             json.dumps(
                 {
                     "version": version,
+                    # Invalidate when the parsing code itself changes.
+                    "engine": engine_fingerprint(),
+                    # Only the options that change what a parse *emits*. Scoring
+                    # flags (min_score, reachability, auth checks, suppressions)
+                    # are applied after the cache, so keying on them would blow
+                    # the whole cache away every time a threshold is tuned.
                     "quick_mode": options.quick_mode,
                     "profile": options.profile,
-                    "stack": config.stack,
-                    "taint_sources": sorted(config.taint_sources),
-                    "taint_sinks": sorted(config.taint_sinks),
+                    "config": _config_cache_key(config),
                 },
                 sort_keys=True,
             ).encode()
@@ -192,8 +255,14 @@ class ParseCache:
                     else SecurityConfig.default_web()
                 )
                 parser = parser_cls(config, options=AnalysisOptions(quick_mode=raw.get("quick_mode", False), profile=raw.get("profile", "default")))
-                parser.nodes = {item["id"]: Node(**item) for item in raw.get("nodes", [])}
-                parser.edges = [Edge(**item) for item in raw.get("edges", [])]
+                try:
+                    parser.nodes = {item["id"]: Node(**item) for item in raw.get("nodes", [])}
+                    parser.edges = [Edge(**item) for item in raw.get("edges", [])]
+                except (TypeError, KeyError):
+                    # Truncated or hand-edited entry: treat as a miss rather than
+                    # letting a poisoned cache file abort the whole scan.
+                    self.misses += 1
+                    return None
                 self.hits += 1
                 return parser
         self.misses += 1

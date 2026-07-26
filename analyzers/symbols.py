@@ -1,4 +1,4 @@
-﻿"""Symbol resolution and SSA helpers."""
+"""Symbol resolution and SSA helpers."""
 
 from __future__ import annotations
 
@@ -41,12 +41,23 @@ class GlobalSymbolTable:
         self.import_aliases: Dict[Tuple[str, str], Dict] = {}
 
     def build(self, graph: Dict) -> None:
-        """Build indexes from a graph."""
+        """Build indexes from a graph.
+
+        Fix 2 additions
+        ---------------
+        * Indexes each non-synthetic FUNCTION node under its short name
+          (``label.split('::')[-1]``) in a new ``short_name_index`` so that
+          stub call-target nodes with qualified labels like ``"Command::new"``
+          can be resolved to the real function whose label is ``"new"``.
+        * Also reads ``metadata.call_name_short`` on synthetic stubs to
+          perform the same lookup during resolution.
+        """
         self.index.clear()
         self.qualified_index.clear()
         self.file_scoped_index.clear()
         self.origin_scoped_index.clear()
         self.import_aliases.clear()
+        self.short_name_index: Dict[str, List[str]] = defaultdict(list)  # Fix 2
         for node in graph.get("nodes", []):
             name = node.get("label")
             if not name:
@@ -58,6 +69,13 @@ class GlobalSymbolTable:
                     self.import_aliases[(origin_key, name)] = node.get("metadata", {})
             if nid not in self.index[name]:
                 self.index[name].append(nid)
+            # Fix 2: short-name index (only for non-synthetic nodes).
+            metadata = node.get("metadata", {})
+            is_synthetic = metadata.get("synthetic") not in (None, False)
+            if not is_synthetic and "::" in name:
+                short = name.split("::")[-1]
+                if nid not in self.short_name_index[short]:
+                    self.short_name_index[short].append(nid)
             qualified_name = node.get("qualified_name")
             if qualified_name:
                 qualified_key = self._qualified_key(node, qualified_name)
@@ -99,7 +117,11 @@ class GlobalSymbolTable:
         file_scope: Optional[str] = None,
         source_node: Optional[Dict] = None,
     ) -> Optional[str]:
-        """Resolve a symbol name to a concrete node id."""
+        """Resolve a symbol name to a concrete node id.
+
+        Fix 2: after the existing lookup chain fails, try the short-name
+        index using ``name.split('::')[-1]``.
+        """
         source_node = source_node or {}
         source_origin = self._origin_key(source_node, fallback=file_scope or "")
         has_stable_origin = self._has_stable_origin(source_node, fallback=file_scope or "")
@@ -121,6 +143,12 @@ class GlobalSymbolTable:
         matches = self.index.get(name, [])
         if len(matches) == 1:
             return matches[0]
+        # Fix 2: short-name fallback for qualified callee labels.
+        short = name.split("::")[-1] if "::" in name else name
+        if short != name:
+            short_matches = getattr(self, "short_name_index", {}).get(short, [])
+            if len(short_matches) == 1:
+                return short_matches[0]
         return None
 
     def resolve_imported(
@@ -266,12 +294,23 @@ class SymbolResolver:
             if endpoint_node.get("type") == NodeType.IMPORT.value:
                 symbol = str(metadata.get("import_alias") or endpoint_node.get("label") or "")
                 return self.symbols.resolve_imported(symbol, file_scope=source_scope, source_node=endpoint_node)
+            # Fix 2: match string synthetic tag (was bool True in old code).
             if metadata.get("synthetic") == "call_target":
+                # Try call_name_short first (the bare leaf after '::').
+                short_name = str(metadata.get("call_name_short") or "")
                 symbol = str(metadata.get("call_name") or endpoint_node.get("label") or "")
-                return (
-                    self.symbols.resolve_imported(symbol, file_scope=source_scope, source_node=source_node)
-                    or self.symbols.resolve(symbol, file_scope=source_scope, source_node=source_node)
-                )
+                resolved = None
+                if short_name and short_name != symbol:
+                    resolved = (
+                        self.symbols.resolve_imported(short_name, file_scope=source_scope, source_node=source_node)
+                        or self.symbols.resolve(short_name, file_scope=source_scope, source_node=source_node)
+                    )
+                if not resolved:
+                    resolved = (
+                        self.symbols.resolve_imported(symbol, file_scope=source_scope, source_node=source_node)
+                        or self.symbols.resolve(symbol, file_scope=source_scope, source_node=source_node)
+                    )
+                return resolved
             return None
         return self.symbols.resolve_imported(endpoint_id, file_scope=source_scope, source_node=source_node) or self.symbols.resolve(
             endpoint_id,
@@ -284,6 +323,7 @@ class SymbolResolver:
         if not endpoint_node:
             return True
         metadata = endpoint_node.get("metadata", {})
+        # Fix 2: synthetic is now a string, not a bool.
         return endpoint_node.get("type") == NodeType.IMPORT.value or metadata.get("synthetic") == "call_target"
 
 
