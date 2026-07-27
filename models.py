@@ -317,6 +317,8 @@ class TaintConfig:
             "os.Getenv", "r.FormValue", "r.PostFormValue", "r.Header.Get",
             "mux.Vars", "c.Param", "c.Query",
             "getParameter", "getHeader", "getQueryString", "getInputStream",
+            "getCookies", "getParameterValues", "getParameterMap", "getRequestURI",
+            "getQueryParameter", "getPart", "getReader",
             "HttpServletRequest", "RequestParam", "PathVariable",
             "Request.Query", "Request.Form", "Request.Headers", "Request.Body",
             "Environment.GetEnvironmentVariable",
@@ -395,7 +397,7 @@ class TaintConfig:
             "getWriter.write", "getWriter.print", "getWriter.println",
             "getWriter.printf", "getWriter.format", "getWriter.append",
             "getOutputStream.write", "response.setHeader", "response.addHeader",
-            "response.sendRedirect", "response.addCookie",
+            "response.sendRedirect",
             # --- LDAP injection ---
             "DirContext.search", "InitialDirContext.search", "LdapContext.search",
             "idc.search", "ctx.search",

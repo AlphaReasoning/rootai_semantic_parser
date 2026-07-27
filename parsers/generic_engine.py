@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
+from analyzers.constants import UNKNOWN, ConstantFolder
 from analyzers.symbols import SSAVersionTracker
 from models import (
     LANGUAGE_SCOPED_SINKS,
@@ -50,6 +51,16 @@ _BODY_NODES: FrozenSet[str] = frozenset(
 
 #: Token types that separate a binding's target from its value.
 _ASSIGN_OPERATORS: FrozenSet[str] = frozenset({"=", ":=", "<-"})
+
+#: Object construction. A constructor builds a value out of what it is handed;
+#: it does not read the outside world. Matching source patterns against the
+#: *type name* made `new javax.servlet.http.Cookie("x", "y")` an attacker-
+#: controlled value because the class is called Cookie, which is one of the
+#: highest-volume false positives OWASP Benchmark exposed. Constructors are
+#: still matched as sinks -- `new FileInputStream(path)` genuinely opens a file.
+_CONSTRUCTION_NODES: FrozenSet[str] = frozenset(
+    {"object_creation_expression", "new_expression", "new", "object_creation"}
+)
 
 #: Constructs that embed an expression inside a string literal. The literal's
 #: prose is not code, but these are: `"$QUERY_STRING"`, `f"ls {path}"` and
@@ -156,6 +167,21 @@ class LanguageProfile:
         )
     )
 
+    #: Iteration that binds a name to each element of a collection. It is an
+    #: assignment in everything but spelling, and there is no assignment
+    #: operator to split on, so it needs its own handling: `for (Cookie c :
+    #: request.getCookies())` is how servlets read cookies, and without this the
+    #: loop variable was never declared and the flow ended at the collection.
+    foreach_nodes: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                "enhanced_for_statement", "for_each_statement", "foreach_statement",
+                "for_in_statement", "for_of_statement", "for_statement",
+                "range_clause", "for_in_clause",
+            }
+        )
+    )
+
     #: Conditional constructs, and the statements that abandon the current path.
     #: A test on a tainted value whose failure branch exits is a validation
     #: guard: the value only reaches later code if it passed the check.
@@ -205,6 +231,15 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._route_by_span: Dict[Tuple[int, int], Tuple[str, str, str]] = {}
         #: Names declared on the type rather than in a method, per file.
         self._field_names: Set[str] = set()
+        #: Root of the file being parsed, for whole-file scope questions.
+        self._root_node: Optional[Any] = None
+        #: Start bytes of identifiers that are written to rather than read.
+        self._assignment_targets: Set[int] = set()
+        self._folder = ConstantFolder(self.profile.literal_nodes, self._get_text)
+        #: (scope, name) -> compile-time value, for the branches that depend on
+        #: it. Populated in source order as bindings are visited, and cleared
+        #: for a name as soon as it is assigned something not constant.
+        self._constants: Dict[Tuple[str, str], Any] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -236,6 +271,9 @@ class GenericTreeSitterParser(TreeSitterParser):
         # field write until the class body's declarations are known, and the
         # declaration may sit below the method that writes it.
         self._field_names = self._collect_field_names(tree.root_node, source)
+        self._constants = {}
+        self._root_node = tree.root_node
+        self._assignment_targets = self._collect_assignment_targets(tree.root_node)
 
         module_id = self._make_id(path, "__module__")
         module_node = self._make_node(
@@ -278,8 +316,179 @@ class GenericTreeSitterParser(TreeSitterParser):
         if node_type in self.profile.call_nodes:
             self._visit_call(node, src, path, fn_id)
 
-        for child in node.children:
+        if node_type in self.profile.exit_nodes:
+            self._visit_return(node, src, fn_id)
+
+        if node_type in self.profile.foreach_nodes:
+            self._visit_foreach(node, src, path, fn_id)
+
+        for child in self._live_children(node, src, fn_id):
             self._walk(child, src, path, parent_id, fn_id)
+
+    def _visit_foreach(self, node, src: str, path: str, fn_id: str) -> None:
+        """Bind a loop variable to the collection it iterates.
+
+        ``for (Cookie theCookie : request.getCookies())`` is an assignment with
+        no assignment operator, so the split that drives every other binding
+        finds nothing and ``theCookie`` is never declared. Reads of it inside
+        the body then resolve to nothing and the flow stops at the collection --
+        which is precisely how servlets, and most request-collection handling,
+        are written.
+
+        Element taint is the collection's taint. Which element is which needs
+        constant propagation over the index, so the whole collection's taint is
+        attributed to each binding.
+        """
+        named = [child for child in node.children if child.is_named]
+        body_types = _BODY_NODES | self.profile.function_nodes
+        header = [child for child in named if child.type not in body_types]
+        if len(header) < 2:
+            return
+        iterable = header[-1]
+        # The loop variable is the last identifier before the iterable; a type
+        # annotation may precede it (`Cookie theCookie`), and destructuring
+        # patterns are left alone rather than guessed at.
+        target = header[-2]
+        name, target_scope = self._binding_target(target, src)
+        if not name:
+            return
+
+        var_id = self._declare_value(
+            name, path, fn_id, node.start_point[0] + 1, "binding", target_scope
+        )
+        if self._matches_pattern(
+            self._text_outside_literals(iterable, src, skip_arguments=True),
+            self._taint_config.sources,
+            LANGUAGE_SCOPED_SOURCES,
+        ):
+            self.nodes[var_id].is_unsafe = True
+            self.nodes[var_id].metadata["is_taint_source"] = True
+            self.nodes[var_id].metadata["tainted_by"] = self._get_text(src, iterable)[:96]
+
+        for referenced in self._referenced_values([iterable], src, fn_id):
+            if referenced != var_id:
+                self.edges.append(
+                    self._edge(
+                        referenced, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "iteration"}
+                    )
+                )
+        for call in self._iter_calls([iterable]):
+            callee_id = self._visit_call(call, src, path, fn_id)
+            if callee_id:
+                self.edges.append(
+                    self._edge(
+                        callee_id, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "iteration"}
+                    )
+                )
+
+    def _visit_return(self, node, src: str, fn_id: str) -> None:
+        """Record what a function hands back to its caller.
+
+        Without this the only route from callee to caller was the synthetic
+        call-target stub, and a tainted argument reached the stub and came
+        straight back out as the call's result -- so ``String safe =
+        clean(param)`` marked ``safe`` tainted no matter what ``clean`` did.
+        Modelling the return means a resolved call carries taint only if the
+        body actually returns it.
+        """
+        for value_id in self._referenced_values([node], src, fn_id):
+            self.edges.append(
+                self._edge(value_id, fn_id, EdgeRelation.DATAFLOW, {"flow_kind": "return"})
+            )
+            self.edges.append(self._edge(value_id, fn_id, EdgeRelation.RETURNS))
+
+    # ------------------------------------------------------------------
+    # Branch feasibility
+    # ------------------------------------------------------------------
+
+    def _live_children(self, node, src: str, fn_id: str) -> List[Any]:
+        """Children that can execute, given what is known at compile time.
+
+        A branch whose condition provably never holds contributes no dataflow,
+        but reachability sees the assignment inside it and reports the value as
+        if it were live. OWASP Benchmark builds its *safe* cases exactly this
+        way -- ``if (false)``, an always-true ternary, a switch on a folded
+        character -- and it is the single largest false-positive class measured.
+
+        Undecidable conditions return every child, so this only ever removes
+        paths that are provably dead.
+        """
+        node_type = node.type
+        if "if_statement" in node_type or node_type in {"if_expression", "if"}:
+            return self._live_if_children(node, src, fn_id)
+        if "switch" in node_type and "block" not in node_type and "label" not in node_type:
+            return self._live_switch_children(node, src, fn_id)
+        return list(node.children)
+
+    def _live_if_children(self, node, src: str, fn_id: str) -> List[Any]:
+        named = [child for child in node.children if child.is_named]
+        if len(named) < 2:
+            return list(node.children)
+        condition = named[0]
+        verdict = self._folder.truth(condition, src, self._scope_constants(fn_id))
+        if verdict is None:
+            return list(node.children)
+        # named[1] is the consequence; anything after it is the else arm.
+        return [condition, named[1]] if verdict else [condition] + named[2:]
+
+    def _live_switch_children(self, node, src: str, fn_id: str) -> List[Any]:
+        named = [child for child in node.children if child.is_named]
+        if len(named) < 2:
+            return list(node.children)
+        discriminant = self._folder.value(named[0], src, self._scope_constants(fn_id))
+        if discriminant is UNKNOWN:
+            return list(node.children)
+
+        block = named[1]
+        groups = [child for child in block.children if child.is_named]
+        selected: List[Any] = []
+        matched = False
+        for group in groups:
+            if not matched and self._group_matches(group, src, discriminant, fn_id):
+                matched = True
+            if matched:
+                selected.append(group)
+                # Without a break the next group runs too, so keep collecting
+                # until one terminates. Modelling fallthrough wrongly would
+                # drop live code, which is the expensive direction to be wrong.
+                if self._terminates(group):
+                    break
+        if not matched:
+            # Nothing matched: only a default arm can run.
+            selected = [group for group in groups if self._is_default(group, src)]
+        return [named[0]] + selected
+
+    def _group_matches(self, group, src: str, discriminant: Any, fn_id: str) -> bool:
+        env = self._scope_constants(fn_id)
+        for child in group.children:
+            if "label" not in child.type and "case" not in child.type:
+                continue
+            if self._is_default(child, src):
+                continue
+            for candidate in child.children:
+                if not candidate.is_named:
+                    continue
+                value = self._folder.value(candidate, src, env)
+                if value is not UNKNOWN and value == discriminant:
+                    return True
+        return False
+
+    def _is_default(self, node, src: str) -> bool:
+        return self._get_text(src, node).strip().lower().startswith("default")
+
+    def _terminates(self, group) -> bool:
+        return any(
+            child.type in self.profile.exit_nodes
+            for child in self._iter_all(group, include_self=True)
+        )
+
+    def _scope_constants(self, fn_id: str) -> Dict[str, Any]:
+        """Constant environment visible inside ``fn_id``."""
+        return {
+            name: value
+            for (scope, name), value in self._constants.items()
+            if scope in (fn_id, _FIELD_SCOPE)
+        }
 
     def _visit_function(self, node, src: str, path: str, parent_id: str, enclosing_fn: str) -> None:
         name = self._function_name(node, src)
@@ -330,19 +539,55 @@ class GenericTreeSitterParser(TreeSitterParser):
     # Bindings
     # ------------------------------------------------------------------
 
+    def _resolve_constant_branches(self, value_nodes: List[Any], src: str, fn_id: str) -> List[Any]:
+        """Replace a decidable ternary with the branch that actually runs.
+
+        ``bar = (7 * 18) + num > 200 ? "constant" : param`` assigns the
+        constant, always. Keeping both arms let ``param`` flow into ``bar`` and
+        on to the sink, which is a path that cannot execute.
+        """
+        env = self._scope_constants(fn_id)
+        resolved: List[Any] = []
+        for item in value_nodes:
+            branches = None
+            if "ternary" in item.type or item.type in {"conditional_expression", "conditional"}:
+                branches = self._folder.ternary_branches(item, src, env)
+            resolved.append(branches[0] if branches else item)
+        return resolved
+
+    def _record_constant(self, name: str, scope: str, fn_id: str, value_nodes: List[Any], src: str) -> None:
+        """Remember, or forget, ``name``'s compile-time value.
+
+        Forgetting matters as much as remembering: once a name is assigned
+        something unknown, every later branch that tests it must be treated as
+        undecidable again.
+        """
+        key = (_FIELD_SCOPE if scope == _FIELD_SCOPE else fn_id, name)
+        value = UNKNOWN
+        if len(value_nodes) == 1:
+            value = self._folder.value(value_nodes[0], src, self._scope_constants(fn_id))
+        if value is UNKNOWN:
+            self._constants.pop(key, None)
+        else:
+            self._constants[key] = value
+
     def _visit_binding(self, node, src: str, path: str, fn_id: str) -> None:
         """Create the bound variable and connect the value side to it."""
         target_nodes, value_nodes = self._split_on_assignment(node)
         if not target_nodes or not value_nodes:
             return
 
+        value_nodes = self._resolve_constant_branches(value_nodes, src, fn_id)
         value_text = " ".join(self._get_text(src, item) for item in value_nodes).strip()
         if not value_text:
             return
 
         taint_config = self._taint_config
         is_source = self._matches_pattern(
-            " ".join(self._text_outside_literals(item, src) for item in value_nodes),
+            " ".join(
+                self._text_outside_literals(item, src, skip_arguments=True)
+                for item in value_nodes
+            ),
             taint_config.sources,
             LANGUAGE_SCOPED_SOURCES,
         )
@@ -352,6 +597,36 @@ class GenericTreeSitterParser(TreeSitterParser):
             for value in value_nodes
             for item in self._iter_all(value, include_self=True)
             if item.type in self.profile.function_nodes
+        ]
+
+        # The value side is resolved before any target is declared, because a
+        # self-referential assignment reads the *previous* value:
+        # `param = URLDecoder.decode(param, "UTF-8")` must connect the old
+        # `param` to the call. Declaring the target first made the lookup return
+        # the node being created, so both ends of the edge were the same node
+        # and the chain ended there without a trace. Every `x = f(x)` -- decode,
+        # trim, normalise, unescape -- was silently losing its taint.
+        #
+        # Identifiers that appear only as call arguments get no direct edge:
+        # their contribution passes *through* that call, and a direct edge would
+        # route taint around any sanitizer sitting in it.
+        call_argument_values: Set[str] = set()
+        for call in self._iter_calls(value_nodes):
+            _, call_arguments = self._call_parts(call, src)
+            if call_arguments is not None:
+                call_argument_values.update(self._referenced_values([call_arguments], src, fn_id))
+
+        direct_references = [
+            referenced
+            for referenced in self._referenced_values(value_nodes, src, fn_id)
+            if referenced not in call_argument_values
+        ]
+        # Visited once here rather than per target, which also stops a
+        # multi-target binding from emitting the same call twice.
+        call_returns = [
+            callee_id
+            for call in self._iter_calls(value_nodes)
+            if (callee_id := self._visit_call(call, src, path, fn_id))
         ]
 
         for target in target_nodes:
@@ -374,26 +649,14 @@ class GenericTreeSitterParser(TreeSitterParser):
                 self._visit_function(bound, src, path, fn_id, fn_id)
                 self._pending_function_name = None
             lineno = node.start_point[0] + 1
+            self._record_constant(name, target_scope, fn_id, value_nodes, src)
             var_id = self._declare_value(name, path, fn_id, lineno, "binding", target_scope)
             if is_source:
                 self.nodes[var_id].is_unsafe = True
                 self.nodes[var_id].metadata["is_taint_source"] = True
                 self.nodes[var_id].metadata["tainted_by"] = value_text[:96]
 
-            # Identifiers that are only arguments to a call in the value do not
-            # flow directly into the binding -- their contribution passes through
-            # that call. A direct edge would route taint around any sanitizer.
-            call_argument_values: Set[str] = set()
-            for call in self._iter_calls(value_nodes):
-                _, call_arguments = self._call_parts(call, src)
-                if call_arguments is not None:
-                    call_argument_values.update(
-                        self._referenced_values([call_arguments], src, fn_id)
-                    )
-
-            for referenced in self._referenced_values(value_nodes, src, fn_id):
-                if referenced in call_argument_values:
-                    continue
+            for referenced in direct_references:
                 if referenced != var_id:
                     self.edges.append(
                         self._edge(
@@ -405,17 +668,15 @@ class GenericTreeSitterParser(TreeSitterParser):
                     )
 
             # A call on the value side returns into the binding.
-            for call in self._iter_calls(value_nodes):
-                callee_id = self._visit_call(call, src, path, fn_id)
-                if callee_id:
-                    self.edges.append(
-                        self._edge(
-                            callee_id,
-                            var_id,
-                            EdgeRelation.DATAFLOW,
-                            {"flow_kind": "call_return"},
-                        )
+            for callee_id in call_returns:
+                self.edges.append(
+                    self._edge(
+                        callee_id,
+                        var_id,
+                        EdgeRelation.DATAFLOW,
+                        {"flow_kind": "call_return"},
                     )
+                )
 
     # ------------------------------------------------------------------
     # Calls
@@ -429,9 +690,10 @@ class GenericTreeSitterParser(TreeSitterParser):
 
         resolved = self._resolve_alias(callee_text)
         taint_config = self._taint_config
-        is_source = self._matches_pattern(
-            callee_text, taint_config.sources, LANGUAGE_SCOPED_SOURCES
-        ) or self._matches_pattern(resolved, taint_config.sources, LANGUAGE_SCOPED_SOURCES)
+        is_source = node.type not in _CONSTRUCTION_NODES and (
+            self._matches_pattern(callee_text, taint_config.sources, LANGUAGE_SCOPED_SOURCES)
+            or self._matches_pattern(resolved, taint_config.sources, LANGUAGE_SCOPED_SOURCES)
+        )
         is_sink = self._matches_pattern(
             callee_text, taint_config.sinks, LANGUAGE_SCOPED_SINKS
         ) or self._matches_pattern(resolved, taint_config.sinks, LANGUAGE_SCOPED_SINKS)
@@ -484,8 +746,32 @@ class GenericTreeSitterParser(TreeSitterParser):
                     )
                 )
             self._note_collection_write(callee_text, argument_ids, src, fn_id)
+        self._note_receiver(callee_text, callee_id, fn_id)
         self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
         return callee_id
+
+    def _note_receiver(self, callee_text: str, callee_id: str, fn_id: str) -> None:
+        """A method's result derives from the object it was called on.
+
+        ``theCookie.getValue()`` returns the cookie's data; only the arguments
+        were connected, so a call with none carried nothing and the chain broke
+        at the receiver. Accessor-heavy APIs -- servlets, ORMs, HTTP clients --
+        are written almost entirely this way.
+        """
+        separator = "->" if "->" in callee_text else "."
+        if separator not in callee_text:
+            return
+        receiver = callee_text.rpartition(separator)[0].strip().split(separator)[-1].strip()
+        if not receiver:
+            return
+        receiver_id = self._lookup_value(receiver, fn_id)
+        if receiver_id is None or receiver_id == callee_id:
+            return
+        self.edges.append(
+            self._edge(
+                receiver_id, callee_id, EdgeRelation.DATAFLOW, {"flow_kind": "receiver"}
+            )
+        )
 
     def _note_collection_write(
         self, callee_text: str, argument_ids: List[str], src: str, fn_id: str
@@ -550,6 +836,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         types are left alone rather than merged into one another. Arguments bind
         to parameters positionally, which is what carries taint into the body.
         """
+        resolved_stubs: Set[str] = set()
         for short_name, callee_id, argument_ids in self._call_sites:
             candidates = self._functions_by_name.get(short_name) or []
             if len(candidates) != 1:
@@ -564,6 +851,23 @@ class GenericTreeSitterParser(TreeSitterParser):
                     target_fn,
                     EdgeRelation.CALLS,
                     {"resolved": True, "call_name": short_name},
+                )
+            )
+            self.nodes[callee_id].metadata["resolved_to"] = target_fn
+            # A stub that is itself a known sink keeps its argument edges even
+            # when a local function shares the name. The argument arriving at
+            # `system(c)` *is* the finding; suppressing it in favour of walking
+            # a same-named declaration loses the very flow being looked for.
+            if not (self.nodes[callee_id].metadata.get("is_taint_sink") or self.nodes[callee_id].is_unsafe):
+                resolved_stubs.add(callee_id)
+            # What the body returns becomes the call's result. The stub is what
+            # the caller's binding reads from, so the return lands here.
+            self.edges.append(
+                self._edge(
+                    target_fn,
+                    callee_id,
+                    EdgeRelation.DATAFLOW,
+                    {"flow_kind": "resolved_return", "call_name": short_name},
                 )
             )
 
@@ -583,6 +887,18 @@ class GenericTreeSitterParser(TreeSitterParser):
                         },
                     )
                 )
+
+        # Arguments to a call whose body is in the graph must not also flow
+        # straight into the stub: the stub returns into the caller's binding, so
+        # that edge is a shortcut around the function. It made every wrapper
+        # transparent -- `String safe = escapeIt(param)` came back tainted
+        # regardless of what `escapeIt` did with it. Library calls keep the
+        # shortcut, because their body is not available to walk.
+        for edge in self.edges:
+            metadata = edge.metadata or {}
+            if metadata.get("flow_kind") == "call_argument" and edge.target in resolved_stubs:
+                metadata["flow_kind"] = "call_argument_resolved"
+                edge.metadata = metadata
 
     def _inline_source_argument(
         self, arguments, src: str, path: str, fn_id: str, taint_config
@@ -640,6 +956,11 @@ class GenericTreeSitterParser(TreeSitterParser):
         "allowlist", "whitelist", "isvalid", "validate",
         ".equals", "in_array", "array_search", "array_key_exists",
         "containskey", "hasprefix", "hassuffix", "elem",
+        # Type predicates. A value that must parse as a number cannot carry a
+        # payload for any sink, which is the same reasoning that makes `int()`
+        # a universal sanitizer rather than a category-specific one.
+        "is_numeric", "isnumeric", "isdigit", "is_int", "is_integer", "ctype_digit",
+        "isinstance", "is_a(", "instanceof", "matches(",
     )
 
     def _note_guard(self, node, src: str, fn_id: str) -> None:
@@ -655,16 +976,37 @@ class GenericTreeSitterParser(TreeSitterParser):
             return
         test = children[0]
         body = children[1:]
-        if not any(
+        test_text = self._get_text(src, test).lower()
+        constraining = any(token in test_text for token in self._CONSTRAINING_TESTS)
+
+        bails_out = any(
             candidate.type in self.profile.exit_nodes
             for branch in body
             for candidate in self._iter_all(branch, include_self=True)
-        ):
-            return
+        )
+        confined = False
+        if not bails_out:
+            # The other half of the same idea, and the more common half. DVWA's
+            # fixed command-exec page wraps the sink in
+            # `if (is_numeric($octet[0]) && ...) { shell_exec(...); }` instead of
+            # returning early, so the code inside only ever runs on input that
+            # satisfied the test.
+            #
+            # But a wrapping guard defends only what is *inside* it, while the
+            # mark lives on the value node and applies everywhere. Sanitizer
+            # state is not flow-sensitive, so claiming otherwise would drop real
+            # findings -- the expensive direction to be wrong in. The mark is
+            # therefore applied only when every use of the value lies within the
+            # guarded branch, which is checkable without flow sensitivity and
+            # errs towards reporting.
+            if not constraining:
+                return
+            confined = True
 
-        test_text = self._get_text(src, test).lower()
-        constraining = any(token in test_text for token in self._CONSTRAINING_TESTS)
-        for value_id in self._referenced_values([test], src, fn_id):
+        span = (node.start_byte, node.end_byte)
+        for value_id, name in self._referenced_named_values([test], src, fn_id):
+            if confined and self._used_outside(name, src, span):
+                continue
             metadata = self.nodes[value_id].metadata
             metadata["guarded"] = True
             metadata["guard_test"] = self._get_text(src, test)[:120]
@@ -672,6 +1014,47 @@ class GenericTreeSitterParser(TreeSitterParser):
                 # Recorded the way an explicit sanitizer is, so the analyzer
                 # treats a passed allowlist check as defending the value.
                 metadata["sanitizer_for"] = ["*"]
+
+    def _referenced_named_values(
+        self, nodes: List[Any], src: str, fn_id: str
+    ) -> List[Tuple[str, str]]:
+        """``(value_id, name)`` pairs for values named inside ``nodes``."""
+        pairs: List[Tuple[str, str]] = []
+        for root in nodes:
+            for candidate in self._iter_all(root, include_self=True):
+                if candidate.type not in self.profile.identifier_nodes:
+                    continue
+                name = self._get_text(src, candidate).lstrip("$").strip()
+                value_id = self._lookup_value(name, fn_id) if name else None
+                if value_id is not None and (value_id, name) not in pairs:
+                    pairs.append((value_id, name))
+        return pairs
+
+    def _used_outside(self, name: str, src: str, span: Tuple[int, int]) -> bool:
+        """Whether ``name`` is also read outside the byte range ``span``.
+
+        Conservative by construction: a same-named local in an unrelated
+        function counts as an outside use, so the guard simply does not apply.
+        Failing to recognise a guard costs precision; claiming one that does not
+        hold costs a finding.
+        """
+        if self._root_node is None:
+            return True
+        start, end = span
+        for candidate in self._iter_all(self._root_node, include_self=True):
+            if candidate.type not in self.profile.identifier_nodes:
+                continue
+            if start <= candidate.start_byte and candidate.end_byte <= end:
+                continue
+            # An assignment *to* the name outside the branch is not a use of the
+            # guarded value; it is where that value came from. DVWA's fixed page
+            # builds `$octet` above the guard and reads it only inside, which is
+            # exactly the shape a write-blind check would reject.
+            if candidate.start_byte in self._assignment_targets:
+                continue
+            if self._get_text(src, candidate).lstrip("$").strip() == name:
+                return True
+        return False
 
     _HTTP_METHODS = frozenset({"get", "post", "put", "delete", "patch", "head", "options", "all", "use"})
 
@@ -865,10 +1248,20 @@ class GenericTreeSitterParser(TreeSitterParser):
 
     def _referenced_values(self, nodes: List[Any], src: str, fn_id: str) -> List[str]:
         """Return ids of already-declared values named inside ``nodes``."""
-        found: List[str] = []
+        # Ordered by position, not by traversal. `_iter_all` walks children with
+        # a stack, which yields them right-to-left; callers bind arguments to
+        # parameters *positionally*, so `doPost(request, response)` was binding
+        # request to the response parameter and vice versa. That put a source on
+        # whichever parameter happened to come last and invented flows between
+        # unrelated values.
+        found: List[Tuple[int, str]] = []
         seen: Set[str] = set()
         for root in nodes:
-            for candidate in self._iter_all(root):
+            # include_self, because the node handed in is frequently the value
+            # itself: `String b = a;` and `for (Cookie c : theCookies)` both
+            # pass a bare identifier, and descendant-only traversal returned
+            # nothing for them -- so a plain copy carried no taint at all.
+            for candidate in self._iter_all(root, include_self=True):
                 if candidate.type in self.profile.identifier_nodes:
                     name = self._get_text(src, candidate).lstrip("$").strip()
                 elif self._is_instance_access(candidate, src):
@@ -885,8 +1278,8 @@ class GenericTreeSitterParser(TreeSitterParser):
                 value_id = self._lookup_value(name, fn_id)
                 if value_id is not None:
                     seen.add(name)
-                    found.append(value_id)
-        return found
+                    found.append((candidate.start_byte, value_id))
+        return [value_id for _, value_id in sorted(found)]
 
     def _is_instance_access(self, node, src: str) -> bool:
         """Whether ``node`` reads a member of the current instance."""
@@ -1031,6 +1424,19 @@ class GenericTreeSitterParser(TreeSitterParser):
     # Scoping: locals, fields, and subscripts
     # ------------------------------------------------------------------
 
+    def _collect_assignment_targets(self, root) -> Set[int]:
+        """Start bytes of every identifier that appears on a binding's left side."""
+        targets: Set[int] = set()
+        for node in self._iter_all(root, include_self=True):
+            if node.type not in self.profile.binding_nodes:
+                continue
+            for target, _ in [self._split_on_assignment(node)][0:1]:
+                for item in target:
+                    for candidate in self._iter_all(item, include_self=True):
+                        if candidate.type in self.profile.identifier_nodes:
+                            targets.add(candidate.start_byte)
+        return targets
+
     def _collect_field_names(self, root, src: str) -> Set[str]:
         """Names declared on the type rather than inside a method.
 
@@ -1121,7 +1527,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         target = self._aliases.get(head.strip())
         return f"{target}{separator}{rest}" if target else callee
 
-    def _text_outside_literals(self, node, src: str) -> str:
+    def _text_outside_literals(self, node, src: str, skip_arguments: bool = False) -> str:
         """Node text with the *contents* of string and numeric literals removed.
 
         Taint patterns are identifier names, so matching them against the inside
@@ -1134,12 +1540,24 @@ class GenericTreeSitterParser(TreeSitterParser):
         Leaves are joined by spaces. Segment matching splits on non-identifier
         characters anyway, so ``os.system`` and ``os . system`` are the same
         sequence, and the literal simply contributes nothing.
+
+        ``skip_arguments`` additionally drops what is passed *into* a call.
+        Deciding whether a binding is a source from its text alone made
+        ``String bar = new Test().doSomething(request, param)`` a source,
+        because the word ``request`` appears in it -- even though the value is
+        whatever the method returns. The receiver still counts:
+        ``request.getParameter("p")`` derives from ``request`` and must stay a
+        source. Arguments do not, and taint that genuinely passes through them
+        arrives on a dataflow edge rather than by spelling.
         """
         literals = self.profile.literal_nodes
+        containers = self.profile.argument_container_nodes
         parts: List[str] = []
         stack = [node]
         while stack:
             current = stack.pop()
+            if skip_arguments and current.type in containers:
+                continue
             if current.type in literals:
                 # A literal's *contents* are text, but an interpolation inside
                 # one is live code: `cmd="$QUERY_STRING"` and `f"ls {path}"`

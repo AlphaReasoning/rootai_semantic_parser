@@ -168,6 +168,13 @@ class TaintAnalyzer:
                 # Declaration record, like the binding kinds below. A tainted
                 # argument reaches this parameter through argument_binding.
                 return []
+            if flow_kind == "call_argument_resolved":
+                # The callee's body is in the graph, so the value reaches it
+                # through argument_binding and comes back only if the body
+                # returns it. Keeping this edge as well would let taint enter
+                # the call stub and leave again as the result, bypassing
+                # whatever the function does to the value.
+                return []
             if flow_kind in _DECLARATION_FLOW_KINDS:
                 # function -> variable records *that* a local is declared here,
                 # not that the function's data flows into it. Treating it as
