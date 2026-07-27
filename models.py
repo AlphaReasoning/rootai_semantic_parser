@@ -212,6 +212,70 @@ def formal_ir_spec() -> Dict[str, Any]:
     }
 
 
+#: Sinks whose names are dangerous in one language and unremarkable in another.
+#:
+#: The sink list is one flat set applied to every language, which is fine while
+#: the names are distinctive (``pickle.loads``, ``execSync``) and wrong the
+#: moment they are ordinary words. PHP's ``include`` executes a file; Java's
+#: ``RequestDispatcher.include`` is how every servlet renders a template, and
+#: scoring against OWASP Benchmark showed that single collision flagging a large
+#: share of the suite from boilerplate alone.
+#:
+#: A pattern listed here only fires in the named languages. Anything absent
+#: applies everywhere, so this stays a short list of known collisions rather
+#: than a per-language sink taxonomy to maintain.
+LANGUAGE_SCOPED_SINKS: Dict[str, FrozenSet[str]] = {
+    # File inclusion: executes the named file in PHP. Elsewhere `include` is
+    # template composition (Java servlets), and `require` is module loading.
+    "include": frozenset({"php"}),
+    "require_once": frozenset({"php"}),
+    # `system(3)` in C, C++ and Objective-C, `system()` in PHP, R and Lua,
+    # `Kernel#system` in Ruby. In Java and C# the segment instead matches
+    # `System.out.println` and `System.Console`, the two most common calls in
+    # either language, which is the collision this exists to stop.
+    "system": frozenset({"c", "cpp", "objc", "php", "ruby", "perl", "lua", "r"}),
+    # Format-string sinks, meaningful only where the format string is
+    # interpreted at the C level. `String.printf` in Java is memory-safe.
+    "printf": frozenset({"c", "cpp", "objc"}),
+    "fprintf": frozenset({"c", "cpp", "objc"}),
+    "sprintf": frozenset({"c", "cpp", "objc"}),
+    # Buffer routines with no bounds argument. Named the same in other
+    # languages' FFI shims, where they are not the unbounded originals.
+    "strcpy": frozenset({"c", "cpp", "objc"}),
+    "strcat": frozenset({"c", "cpp", "objc"}),
+    "gets": frozenset({"c", "cpp", "objc"}),
+    # `popen(3)` and PHP's `popen`. `Popen` in Python is `subprocess.Popen`,
+    # which the distinctive pattern already covers.
+    "popen": frozenset({"c", "cpp", "php", "perl", "lua"}),
+    # Python's `compile()` builds executable code. `Pattern.compile`,
+    # `Regex.compile` and template compilation elsewhere do not.
+    "compile": frozenset({"python"}),
+    # Distinctive as `render_template_string`; as a bare word `Template` is a
+    # class name in most typed languages.
+    "Template": frozenset({"python", "javascript", "typescript", "php", "ruby"}),
+    # Scheduling with a string body evaluates it -- but only in browsers/Node.
+    "setTimeout": frozenset({"javascript", "typescript"}),
+    # Dynamic library loading, as the C API. Other languages wrap it safely.
+    "dlopen": frozenset({"c", "cpp", "objc"}),
+    "dlsym": frozenset({"c", "cpp", "objc"}),
+}
+
+#: Sources with the same problem. ``read`` is the C socket/file read; in every
+#: other language it is a method on a stream that has no bearing on trust, and
+#: ``ENV``/``env:`` collide with ordinary variable names.
+LANGUAGE_SCOPED_SOURCES: Dict[str, FrozenSet[str]] = {
+    "read": frozenset({"c", "cpp", "objc"}),
+    "recv": frozenset({"c", "cpp", "objc"}),
+    "recvfrom": frozenset({"c", "cpp", "objc"}),
+    "fgets": frozenset({"c", "cpp", "objc"}),
+    "fread": frozenset({"c", "cpp", "objc"}),
+    "scanf": frozenset({"c", "cpp", "objc"}),
+    "fscanf": frozenset({"c", "cpp", "objc"}),
+    "sscanf": frozenset({"c", "cpp", "objc"}),
+    "getenv": frozenset({"c", "cpp", "objc", "php", "lua"}),
+}
+
+
 @dataclass
 class TaintConfig:
     """Taint source, sink, and sanitizer definitions."""
@@ -326,9 +390,24 @@ class TaintConfig:
             # --- Cross-site scripting ---
             "res.write", "res.send", "dangerouslySetInnerHTML", "outerHTML",
             "insertAdjacentHTML", "v-html",
+            # Servlet response writers. Qualified through `getWriter` on purpose:
+            # a bare `println` is `System.out.println`, which writes to stdout.
+            "getWriter.write", "getWriter.print", "getWriter.println",
+            "getWriter.printf", "getWriter.format", "getWriter.append",
+            "getOutputStream.write", "response.setHeader", "response.addHeader",
+            "response.sendRedirect", "response.addCookie",
+            # --- LDAP injection ---
+            "DirContext.search", "InitialDirContext.search", "LdapContext.search",
+            "idc.search", "ctx.search",
+            # --- XPath injection ---
+            "XPath.evaluate", "xp.evaluate", "xpath.evaluate", "XPathExpression.evaluate",
+            "selectNodes", "selectSingleNode",
             # --- Path traversal / file disclosure ---
             "fs.readFile", "fs.readFileSync", "fs.createReadStream",
             "sendFile", "res.download", "FileInputStream", "File.ReadAllText",
+            "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile",
+            "Files.newInputStream", "Files.newOutputStream", "Files.readAllBytes",
+            "Files.write", "Paths.get",
             # --- Template injection ---
             "render_template_string", "Template", "compile_template",
             # --- IR v0.3.0: C sinks ---

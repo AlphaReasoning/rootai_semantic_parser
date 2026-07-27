@@ -8,7 +8,44 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-from models import AnalysisOptions, EdgeRelation, TaintConfig, TaintPath
+from models import (
+    LANGUAGE_SCOPED_SINKS,
+    LANGUAGE_SCOPED_SOURCES,
+    AnalysisOptions,
+    EdgeRelation,
+    TaintConfig,
+    TaintPath,
+)
+
+#: Fallback language identification for nodes whose parser recorded none.
+_EXTENSION_LANGUAGES: Dict[str, str] = {
+    "py": "python", "js": "javascript", "mjs": "javascript", "cjs": "javascript",
+    "ts": "typescript", "tsx": "typescript", "jsx": "javascript",
+    "go": "go", "java": "java", "cs": "csharp", "php": "php", "rb": "ruby",
+    "rs": "rust", "c": "c", "h": "c", "cpp": "cpp", "cc": "cpp", "cxx": "cpp",
+    "hpp": "cpp", "hh": "cpp", "m": "objc", "mm": "objc", "kt": "kotlin",
+    "kts": "kotlin", "swift": "swift", "scala": "scala", "lua": "lua",
+    "r": "r", "sh": "bash", "bash": "bash",
+}
+
+#: Segment-keyed views of the language-scope maps, memoised per map object.
+_SCOPE_BY_SEGMENTS: Dict[int, Dict[Tuple[str, ...], FrozenSet[str]]] = {}
+
+
+def language_scope(scope: Dict[str, FrozenSet[str]]) -> Dict[Tuple[str, ...], FrozenSet[str]]:
+    """Re-key a language-scope map by segments instead of literal spelling.
+
+    Profiles spell the same sink more than one way -- the base config has
+    ``system`` and the bugbounty profile adds ``system(`` -- and a scope rule
+    written against one spelling silently failed to cover the other. Both
+    tokenise to ``('system',)``, which is the identity that matters.
+    """
+    key = id(scope)
+    cached = _SCOPE_BY_SEGMENTS.get(key)
+    if cached is None:
+        cached = {TaintAnalyzer._segments(pattern): languages for pattern, languages in scope.items()}
+        _SCOPE_BY_SEGMENTS[key] = cached
+    return cached
 
 #: Anything that is not part of an identifier separates one name from the next,
 #: so ``os.system(cmd)``, ``ctx->recv_buf`` and ``Command::new(&x)`` all reduce to
@@ -226,11 +263,43 @@ class TaintAnalyzer:
                 break
         return self._node_idx.get(best) if best else None
 
-    def _matches(self, node: Dict, keyword_set: Set[str]) -> bool:
+    def _matches(
+        self,
+        node: Dict,
+        keyword_set: Set[str],
+        scope: Optional[Dict[str, FrozenSet[str]]] = None,
+    ) -> bool:
+        """Return whether any pattern in ``keyword_set`` describes ``node``.
+
+        ``scope`` restricts individual patterns to the languages they are
+        meaningful in. Without it, PHP's ``include`` sink fires on Java's
+        ``RequestDispatcher.include`` and the C ``system`` sink fires on
+        ``System.out.println``, both of which are boilerplate rather than risk.
+        """
         label_segments = self._node_segments(node)
         if not label_segments:
             return False
-        return any(self._pattern_matches(label_segments, kw) for kw in keyword_set)
+        language = self._language(node) if scope else None
+        for keyword in keyword_set:
+            if not self._pattern_matches(label_segments, keyword):
+                continue
+            if scope is not None:
+                allowed = language_scope(scope).get(self._segments(keyword))
+                # An unknown language is not evidence the pattern is wrong, so
+                # scoping only rejects a match it can positively contradict.
+                if allowed is not None and language is not None and language not in allowed:
+                    continue
+            return True
+        return False
+
+    def _language(self, node: Dict) -> Optional[str]:
+        """The language a node was parsed from, by metadata then by extension."""
+        metadata = node.get("metadata") or {}
+        language = metadata.get("language")
+        if language:
+            return str(language).lower()
+        suffix = str(node.get("file", "")).rsplit(".", 1)
+        return _EXTENSION_LANGUAGES.get(suffix[-1].lower()) if len(suffix) == 2 else None
 
     def _is_taint_source(self, node: Dict) -> bool:
         """Return whether a node introduces externally controlled data.
@@ -242,7 +311,7 @@ class TaintAnalyzer:
         source and made each sink its own source, producing ``system -> system``
         style self-loops.
         """
-        if self._matches(node, self.config.sources):
+        if self._matches(node, self.config.sources, LANGUAGE_SCOPED_SOURCES):
             return True
         metadata = node.get("metadata") or {}
         return bool(metadata.get("is_taint_source") or metadata.get("tainted_by"))
@@ -269,7 +338,7 @@ class TaintAnalyzer:
         but the node's label remains the source text. Where a parser has already
         made that determination, honour it.
         """
-        if self._matches(node, self.config.sinks):
+        if self._matches(node, self.config.sinks, LANGUAGE_SCOPED_SINKS):
             return True
         metadata = node.get("metadata") or {}
         return bool(metadata.get("is_taint_sink"))

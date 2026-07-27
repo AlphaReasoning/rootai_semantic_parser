@@ -28,11 +28,19 @@ and the import table are both available, and is recorded on the node as
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from analyzers.symbols import SSAVersionTracker
-from models import AnalysisOptions, EdgeRelation, NodeType, SecurityConfig
+from models import (
+    LANGUAGE_SCOPED_SINKS,
+    LANGUAGE_SCOPED_SOURCES,
+    AnalysisOptions,
+    EdgeRelation,
+    NodeType,
+    SecurityConfig,
+)
 from parsers.engines import TreeSitterParser, _mark_function_entrypoint
 
 #: Function body containers. A declaration's own name is never inside one.
@@ -42,6 +50,40 @@ _BODY_NODES: FrozenSet[str] = frozenset(
 
 #: Token types that separate a binding's target from its value.
 _ASSIGN_OPERATORS: FrozenSet[str] = frozenset({"=", ":=", "<-"})
+
+#: Constructs that embed an expression inside a string literal. The literal's
+#: prose is not code, but these are: `"$QUERY_STRING"`, `f"ls {path}"` and
+#: `"${req.query.c}"` all read a value that taint has to follow.
+_INTERPOLATION_NODES: FrozenSet[str] = frozenset(
+    {
+        "string_interpolation", "interpolation", "template_substitution",
+        "simple_expansion", "expansion", "command_substitution",
+        "string_expansion", "substitution", "interpolated_string_expression",
+        "subshell", "arithmetic_expansion",
+    }
+)
+
+#: Scope key standing in for "declared on the object, not in this function".
+#: Fields outlive the method that writes them, so a write in one method and a
+#: read in another must resolve to the same value node. Function-scoped lookup
+#: put them in separate scopes and lost the flow entirely -- which is how every
+#: MVC controller that stashes request data on ``this`` is written.
+_FIELD_SCOPE = "__field__"
+
+#: How each language spells "the current instance". A binding whose target is
+#: prefixed with one of these names a field rather than a local.
+_INSTANCE_PREFIXES: Tuple[str, ...] = ("this.", "self.", "$this->", "this->", "@")
+
+#: Methods that store their argument into the receiver. The value is now
+#: reachable through the collection, so taint has to flow *backwards* into the
+#: receiver rather than only forwards into the call.
+_COLLECTION_WRITERS: FrozenSet[str] = frozenset(
+    {
+        "push", "append", "add", "addall", "insert", "put", "putall", "set",
+        "setattr", "offer", "enqueue", "unshift", "extend", "update", "write",
+        "addelement", "concat", "join",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -161,6 +203,8 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._route_handlers_by_name: Dict[str, List[Tuple[str, str, str]]] = {}
         #: (start_byte, end_byte) of an inline handler -> the route it serves.
         self._route_by_span: Dict[Tuple[int, int], Tuple[str, str, str]] = {}
+        #: Names declared on the type rather than in a method, per file.
+        self._field_names: Set[str] = set()
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -188,6 +232,10 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._call_sites = []
         self._route_handlers_by_name = {}
         self._route_by_span = {}
+        # Collected before the walk: a bare assignment cannot be recognised as a
+        # field write until the class body's declarations are known, and the
+        # declaration may sit below the method that writes it.
+        self._field_names = self._collect_field_names(tree.root_node, source)
 
         module_id = self._make_id(path, "__module__")
         module_node = self._make_node(
@@ -293,7 +341,11 @@ class GenericTreeSitterParser(TreeSitterParser):
             return
 
         taint_config = self._taint_config
-        is_source = self._matches_pattern(value_text, taint_config.sources)
+        is_source = self._matches_pattern(
+            " ".join(self._text_outside_literals(item, src) for item in value_nodes),
+            taint_config.sources,
+            LANGUAGE_SCOPED_SOURCES,
+        )
 
         bound_functions = [
             item
@@ -303,7 +355,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         ]
 
         for target in target_nodes:
-            name = self._first_identifier_text(target, src)
+            name, target_scope = self._binding_target(target, src)
             if not name:
                 # `this.handleUpdate = (req) => {...}` is the ordinary Node/Express
                 # idiom. The target is a member expression with no plain
@@ -322,7 +374,7 @@ class GenericTreeSitterParser(TreeSitterParser):
                 self._visit_function(bound, src, path, fn_id, fn_id)
                 self._pending_function_name = None
             lineno = node.start_point[0] + 1
-            var_id = self._declare_value(name, path, fn_id, lineno, "binding")
+            var_id = self._declare_value(name, path, fn_id, lineno, "binding", target_scope)
             if is_source:
                 self.nodes[var_id].is_unsafe = True
                 self.nodes[var_id].metadata["is_taint_source"] = True
@@ -377,12 +429,12 @@ class GenericTreeSitterParser(TreeSitterParser):
 
         resolved = self._resolve_alias(callee_text)
         taint_config = self._taint_config
-        is_source = self._matches_pattern(callee_text, taint_config.sources) or self._matches_pattern(
-            resolved, taint_config.sources
-        )
-        is_sink = self._matches_pattern(callee_text, taint_config.sinks) or self._matches_pattern(
-            resolved, taint_config.sinks
-        )
+        is_source = self._matches_pattern(
+            callee_text, taint_config.sources, LANGUAGE_SCOPED_SOURCES
+        ) or self._matches_pattern(resolved, taint_config.sources, LANGUAGE_SCOPED_SOURCES)
+        is_sink = self._matches_pattern(
+            callee_text, taint_config.sinks, LANGUAGE_SCOPED_SINKS
+        ) or self._matches_pattern(resolved, taint_config.sinks, LANGUAGE_SCOPED_SINKS)
 
         callee_id = self._make_id(path, f"__call_target__{callee_text}")
         if callee_id not in self.nodes:
@@ -431,8 +483,48 @@ class GenericTreeSitterParser(TreeSitterParser):
                         },
                     )
                 )
+            self._note_collection_write(callee_text, argument_ids, src, fn_id)
         self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
         return callee_id
+
+    def _note_collection_write(
+        self, callee_text: str, argument_ids: List[str], src: str, fn_id: str
+    ) -> None:
+        """Flow taint back into a receiver that was just written into.
+
+        ``args.add(param)`` and ``map.put(key, param)`` move data *into* the
+        receiver, so a later read of ``args`` is a read of ``param``. Modelling
+        calls as forward-only lost that: the taint went into the call node and
+        stopped, while the collection stayed clean. Collections built from
+        request data and then passed to a sink are common enough in Java and
+        JavaScript that the flow simply disappeared.
+
+        The whole container is tainted rather than the written key, which
+        over-approximates: ``map.put("a", tainted)`` also taints
+        ``map.get("b")``. Distinguishing them needs constant propagation over
+        the key, and reporting the flow is the safer direction to be wrong in.
+        """
+        if "." not in callee_text and "->" not in callee_text:
+            return
+        separator = "->" if "->" in callee_text else "."
+        receiver, _, method = callee_text.rpartition(separator)
+        receiver = receiver.strip().split(separator)[-1].strip()
+        if not receiver or method.strip().lower() not in _COLLECTION_WRITERS:
+            return
+        receiver_id = self._lookup_value(receiver, fn_id)
+        if receiver_id is None:
+            return
+        for argument_id in argument_ids:
+            if argument_id == receiver_id:
+                continue
+            self.edges.append(
+                self._edge(
+                    argument_id,
+                    receiver_id,
+                    EdgeRelation.DATAFLOW,
+                    {"flow_kind": "collection_write", "call_name": callee_text},
+                )
+            )
 
     def _apply_deferred_routes(self) -> None:
         """Attach routes registered before their handler was declared."""
@@ -504,7 +596,11 @@ class GenericTreeSitterParser(TreeSitterParser):
         relying on call-graph reachability to imply it.
         """
         text = self._get_text(src, arguments).strip()
-        if not text or not self._matches_pattern(text, taint_config.sources):
+        if not text or not self._matches_pattern(
+            self._text_outside_literals(arguments, src),
+            taint_config.sources,
+            LANGUAGE_SCOPED_SOURCES,
+        ):
             return None
         expression = text.strip("()").strip()
         if not expression:
@@ -736,11 +832,19 @@ class GenericTreeSitterParser(TreeSitterParser):
     # ------------------------------------------------------------------
 
     def _declare_value(
-        self, name: str, path: str, fn_id: str, lineno: int, flow_kind: str
+        self, name: str, path: str, fn_id: str, lineno: int, flow_kind: str, scope: str = ""
     ) -> str:
-        """Create a VARIABLE node for ``name`` and register it for lookup."""
+        """Create a VARIABLE node for ``name`` and register it for lookup.
+
+        ``scope`` of ``_FIELD_SCOPE`` registers the value against the object
+        instead of the current function, so a method that reads the field later
+        resolves to this same node.
+        """
         ssa_label = name if self.options.quick_mode else self._ssa.get_versioned_id(name)
-        var_id = self._make_id(path, f"{fn_id}::{flow_kind}::{ssa_label}")
+        # Field identity must not include the writing function, or two methods
+        # touching one field would still produce two unconnected nodes.
+        owner = _FIELD_SCOPE if scope == _FIELD_SCOPE else fn_id
+        var_id = self._make_id(path, f"{owner}::{flow_kind}::{ssa_label}")
         if var_id not in self.nodes:
             var_node = self._make_node(var_id, NodeType.VARIABLE, name, path, lineno)
             var_node.metadata.update(
@@ -754,7 +858,9 @@ class GenericTreeSitterParser(TreeSitterParser):
             self.edges.append(
                 self._edge(fn_id, var_id, EdgeRelation.DATAFLOW, {"flow_kind": flow_kind})
             )
-        self._value_nodes[(fn_id, name)] = var_id
+        if scope == _FIELD_SCOPE:
+            self.nodes[var_id].metadata["scope"] = "field"
+        self._value_nodes[(owner, name)] = var_id
         return var_id
 
     def _referenced_values(self, nodes: List[Any], src: str, fn_id: str) -> List[str]:
@@ -763,16 +869,40 @@ class GenericTreeSitterParser(TreeSitterParser):
         seen: Set[str] = set()
         for root in nodes:
             for candidate in self._iter_all(root):
-                if candidate.type not in self.profile.identifier_nodes:
+                if candidate.type in self.profile.identifier_nodes:
+                    name = self._get_text(src, candidate).lstrip("$").strip()
+                elif self._is_instance_access(candidate, src):
+                    # `this.cmd` -- most grammars tag the member as
+                    # `property_identifier` rather than `identifier`, so a read
+                    # of a field resolved to nothing while the write resolved
+                    # fine. Adding the member type wholesale would make every
+                    # `.foo` a value reference; only instance access needs it.
+                    name = self._instance_member_name(candidate, src)
+                else:
                     continue
-                name = self._get_text(src, candidate).lstrip("$").strip()
                 if not name or name in seen:
                     continue
-                value_id = self._value_nodes.get((fn_id, name))
+                value_id = self._lookup_value(name, fn_id)
                 if value_id is not None:
                     seen.add(name)
                     found.append(value_id)
         return found
+
+    def _is_instance_access(self, node, src: str) -> bool:
+        """Whether ``node`` reads a member of the current instance."""
+        if node.child_count < 2:
+            return False
+        head = self._get_text(src, node.children[0]).strip().lower()
+        return head in {"this", "self", "$this", "@"}
+
+    def _instance_member_name(self, node, src: str) -> str:
+        """The field name in ``this.cmd`` / ``self.cmd`` / ``$this->cmd``."""
+        text = self._get_text(src, node).strip()
+        for prefix in _INSTANCE_PREFIXES:
+            if text.lower().startswith(prefix):
+                member = text[len(prefix):].strip()
+                return re.split(r"[^0-9A-Za-z_]", member, maxsplit=1)[0]
+        return ""
 
     # ------------------------------------------------------------------
     # Grammar helpers
@@ -897,6 +1027,66 @@ class GenericTreeSitterParser(TreeSitterParser):
                 return self._get_text(src, candidate).lstrip("$").strip()
         return ""
 
+    # ------------------------------------------------------------------
+    # Scoping: locals, fields, and subscripts
+    # ------------------------------------------------------------------
+
+    def _collect_field_names(self, root, src: str) -> Set[str]:
+        """Names declared on the type rather than inside a method.
+
+        Walks the tree without descending into function bodies, so what remains
+        is the class body: Java's ``private String c;``, C#'s auto-properties,
+        Kotlin's ``val`` properties. A later bare-name assignment to one of
+        these is a field write even though nothing in the statement says so.
+        """
+        names: Set[str] = set()
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current.type in self.profile.function_nodes:
+                continue
+            if current.type in self.profile.binding_nodes:
+                name = self._first_identifier_text(current, src)
+                if name:
+                    names.add(name)
+            stack.extend(current.children)
+        return names
+
+    def _binding_target(self, target, src: str) -> Tuple[str, str]:
+        """Return ``(name, scope)`` for an assignment target.
+
+        Three shapes, all of which used to collapse to "first identifier in the
+        subtree", which is right only for the first one:
+
+        * ``bar = ...`` -- a local, unless the name is a declared field.
+        * ``this.cmd = ...`` -- a field. The first identifier is ``this``, so
+          the trailing member is the name that matters.
+        * ``opts['k'] = ...`` / ``opts.k = ...`` -- a write *into* a value. The
+          container is tainted as a whole; tracking the key would need constant
+          propagation, and over-approximating here is the safe direction.
+        """
+        text = self._get_text(src, target).strip()
+        lowered = text.lower()
+        for prefix in _INSTANCE_PREFIXES:
+            if lowered.startswith(prefix):
+                member = text[len(prefix):].strip()
+                # `this.opts['k']` is still a write to the field `opts`.
+                name = re.split(r"[^0-9A-Za-z_]", member, maxsplit=1)[0]
+                return (name, _FIELD_SCOPE) if name else ("", "")
+
+        name = self._first_identifier_text(target, src)
+        if not name:
+            return "", ""
+        scope = _FIELD_SCOPE if name in self._field_names else ""
+        return name, scope
+
+    def _lookup_value(self, name: str, fn_id: str) -> Optional[str]:
+        """Resolve a name to its value node, preferring the local over the field."""
+        local = self._value_nodes.get((fn_id, name))
+        if local is not None:
+            return local
+        return self._value_nodes.get((_FIELD_SCOPE, name))
+
     def _iter_calls(self, nodes: List[Any]):
         for root in nodes:
             for candidate in self._iter_all(root, include_self=True):
@@ -931,13 +1121,67 @@ class GenericTreeSitterParser(TreeSitterParser):
         target = self._aliases.get(head.strip())
         return f"{target}{separator}{rest}" if target else callee
 
-    @staticmethod
-    def _matches_pattern(text: str, patterns: Set[str]) -> bool:
-        """Segment-aligned match, mirroring the taint analyzer's matcher."""
-        from analyzers.taint import TaintAnalyzer
+    def _text_outside_literals(self, node, src: str) -> str:
+        """Node text with the *contents* of string and numeric literals removed.
+
+        Taint patterns are identifier names, so matching them against the inside
+        of a string makes every servlet's
+        ``getWriter().println("Error processing request.")`` a taint source --
+        the literal contains the segment ``request``. Scoring against OWASP
+        Benchmark showed that one collision accounted for the largest share of
+        false positives, because the string appears in nearly every catch block.
+
+        Leaves are joined by spaces. Segment matching splits on non-identifier
+        characters anyway, so ``os.system`` and ``os . system`` are the same
+        sequence, and the literal simply contributes nothing.
+        """
+        literals = self.profile.literal_nodes
+        parts: List[str] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type in literals:
+                # A literal's *contents* are text, but an interpolation inside
+                # one is live code: `cmd="$QUERY_STRING"` and `f"ls {path}"`
+                # both read a variable. Dropping the whole literal discarded
+                # those reads and lost the flow, so descend for them alone.
+                stack.extend(
+                    child
+                    for child in self._iter_all(current, include_self=False)
+                    if child.type in _INTERPOLATION_NODES
+                )
+                continue
+            if current.child_count == 0:
+                parts.append(self._get_text(src, current))
+                continue
+            stack.extend(reversed(current.children))
+        return " ".join(part for part in parts if part).strip()
+
+    def _matches_pattern(
+        self,
+        text: str,
+        patterns: Set[str],
+        scope: Optional[Dict[str, FrozenSet[str]]] = None,
+    ) -> bool:
+        """Segment-aligned match, mirroring the taint analyzer's matcher.
+
+        ``scope`` suppresses patterns that do not mean anything dangerous in
+        this parser's language. The analyzer applies the same restriction, but
+        a match here is recorded as ``is_taint_sink`` metadata that the analyzer
+        then honours without re-checking, so the two must agree.
+        """
+        from analyzers.taint import TaintAnalyzer, language_scope
 
         segments = TaintAnalyzer._segments(text)
-        return any(TaintAnalyzer._pattern_matches(segments, pattern) for pattern in patterns)
+        for pattern in patterns:
+            if not TaintAnalyzer._pattern_matches(segments, pattern):
+                continue
+            if scope is not None:
+                allowed = language_scope(scope).get(TaintAnalyzer._segments(pattern))
+                if allowed is not None and self.profile.language not in allowed:
+                    continue
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1282,14 @@ _PHP_PROFILE = LanguageProfile(
     param_container_nodes=frozenset({"formal_parameters"}),
     param_name_nodes=frozenset({"simple_parameter", "variadic_parameter", "property_promotion_parameter"}),
     binding_nodes=frozenset({"assignment_expression", "augmented_assignment_expression"}),
-    call_nodes=frozenset({"function_call_expression", "member_call_expression", "scoped_call_expression", "object_creation_expression"}),
+    # `include`/`require` are their own expression types, not function calls, so
+    # PHP's most direct code-execution sink was never visited at all. The
+    # keyword sits where a callee would, which is all `_call_parts` needs.
+    call_nodes=frozenset({
+        "function_call_expression", "member_call_expression", "scoped_call_expression",
+        "object_creation_expression", "include_expression", "include_once_expression",
+        "require_expression", "require_once_expression",
+    }),
     argument_container_nodes=frozenset({"arguments"}),
     identifier_nodes=frozenset({"variable_name", "name"}),
     import_nodes=frozenset({"namespace_use_declaration"}),

@@ -36,7 +36,7 @@ Measured on the commit that introduced this document.
 |---|---|---:|---:|---|
 | NodeGoat (`app/`) | vulnerable | 2 | 1.2s | documented SSJS injection and SSRF, both found |
 | DVWA | vulnerable | 18 | 4.9s | 15 SQL injection, 3 RCE; **0 in `impossible.php`** |
-| Flask (`src/`) | clean | 6 | 0.9s | see below |
+| Flask (`src/`) | clean | 7 | 0.9s | see below |
 | Requests (`src/`) | clean | 1 | 0.9s | its own URL fetch |
 
 DVWA findings land in the low (6), medium (4) and high (3) tiers and none in
@@ -50,7 +50,7 @@ They are **real data flows that are not vulnerabilities in context**. Flask's
 that is the feature. Requests genuinely fetches a URL it was handed.
 
 This category is irreducible without understanding intent, and it is why the
-tool is a triage aid rather than a submission source. Six findings across a
+tool is a triage aid rather than a submission source. Seven findings across a
 mature framework is a few seconds of human review, which is the bar that
 matters. Note these counts are pre-filter; a `semantic-parser scan` with the
 bugbounty profile reports fewer.
@@ -93,6 +93,90 @@ findings carry `routes`, so NodeGoat reports
     SSRF  score  85  GET /research         research.js:16
 
 rather than naming a function. A URL is something an operator can go and test.
+
+## Measured recall and precision: OWASP Benchmark
+
+Everything above measures regressions, not accuracy. DVWA and NodeGoat document
+vulnerability *classes*, not lines, so "18 findings" cannot be divided by
+anything. OWASP BenchmarkJava can: it ships `expectedresults-1.2.csv` with a
+real/not-real verdict and a CWE for each of 2,740 generated servlets, one test
+case per file.
+
+```bash
+python tools/score_owasp_benchmark.py --benchmark /path/to/BenchmarkJava
+```
+
+Scored across the 1,572 cases in the six classes this scanner models as taint
+flows. Weak randomness, hashing, cipher strength and cookie flags are excluded:
+they are decided by a single API choice, a taint engine has nothing to say about
+them, and including them would move the headline without measuring anything.
+
+| category | cases | recall | FP rate | precision | score |
+|---|---:|---:|---:|---:|---:|
+| cmdi | 251 | 57.1% | 53.6% | 51.8% | +3.5% |
+| sqli | 504 | 62.9% | 65.5% | 52.9% | −2.6% |
+| xss | 455 | 63.4% | 72.2% | 50.8% | −8.8% |
+| pathtraver | 268 | 75.2% | 79.3% | 48.3% | −4.1% |
+| ldapi | 59 | 77.8% | 81.2% | 44.7% | −3.5% |
+| xpathi | 35 | 80.0% | 90.0% | 40.0% | −10.0% |
+| **all** | **1572** | **65.0%** | **69.2%** | **50.5%** | **−4.2%** |
+
+"Score" is OWASP's own metric, recall minus false-positive rate. It is the only
+column here that cannot be gamed by flagging everything, and **0% is what random
+guessing achieves**. At −4.2% this scanner does not currently beat guessing on
+this benchmark.
+
+That number is the point of running it. Three defects it exposed have been
+fixed, and one has not.
+
+**Fixed — sinks were not language-scoped.** One flat sink list was applied to
+every language, so PHP's `include` fired on Java's
+`RequestDispatcher.include` and C's `system` fired on `System.out.println`.
+Both appear in servlet boilerplate, so a large share of the suite was flagged
+from code that carries no data. Before scoping, XSS scored 20.8% recall — every
+one of which was this boilerplate landing in a file that happened to be a true
+case. Genuine XSS recall was zero.
+
+**Fixed — string literals were matched against source patterns.**
+`println("Error processing request.")` contains the segment `request`, making
+the literal a taint source. That line is in the catch block of nearly every
+servlet written. Literal contents are now excluded, while interpolations inside
+them (`"$QUERY_STRING"`, `f"ls {c}"`) are still read, since those are code.
+
+**Fixed — whole sink families were missing.** Servlet response writers, LDAP
+`DirContext.search`, XPath `evaluate`, and most of the `java.io` file
+constructors were absent, which is why three categories scored 0% recall.
+
+**Not fixed — no constant propagation.** Of the false positives remaining,
+**58 of 95 in a sampled run are cases whose control flow is statically
+determined by a constant**, and the rest are mostly the same shape reached
+through a helper. Benchmark builds its safe cases by routing a genuinely
+tainted value through a construct that provably discards it:
+
+```java
+bar = (7 * 18) + num > 200 ? "This_should_always_happen" : param;   // always the constant
+char switchTarget = "ABC".charAt(1);                               // always 'B'
+switch (switchTarget) { case 'A': bar = param; break;
+                        case 'B': bar = "bob";  break; }            // always the constant
+map.put("keyB", param); bar = (String) map.get("keyA");             // reads the other key
+```
+
+Every one is real dataflow by graph reachability and dead by evaluation. A
+reachability engine cannot separate them, and no amount of sink tuning will:
+the fix is constant propagation with branch elimination, which is the single
+highest-value engine change available. Until it exists, expect the false
+positive rate on this benchmark to stay near 70%.
+
+### How much of this generalises
+
+Benchmark is synthetic and adversarial by design — real code does not usually
+guard a sink with an always-true ternary. The false-positive rate here is
+therefore a **worst case**, not the rate on real targets; the corpus above still
+reports 7 findings across all of Flask and 1 across Requests. The recall figure
+generalises better, because the source-to-sink shapes are ordinary.
+
+Read the two together: recall of 65% is the honest reach of the engine, and the
+noise floor on real code is much lower than 69%.
 
 ## Known limits this exercise exposed
 

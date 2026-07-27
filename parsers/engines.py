@@ -282,7 +282,7 @@ class PythonParser(LanguageParser):
                 metadata["param_ids"] = param_ids
             elif isinstance(node, ast.Call):
                 deferred_calls.append(node)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
                 deferred_assigns.append(node)
             elif isinstance(node, ast.Return) and node.value is not None:
                 enclosing = self._enclosing(getattr(node, "lineno", 0), fn_ranges, module_id)
@@ -296,7 +296,14 @@ class PythonParser(LanguageParser):
         deferred_assigns.sort(key=lambda x: getattr(x, "lineno", 0))
         taint_sources = {"request", "args", "form", "params", "environ", "argv", "input"}
         for assign_node in deferred_assigns:
-            value_node = getattr(assign_node, "value", None)
+            # `for row in request.form:` binds `row` to the iterated value, which
+            # is an assignment in every respect except the keyword. Skipping it
+            # lost every flow that arrives through a loop -- the ordinary way
+            # request collections are consumed.
+            if isinstance(assign_node, (ast.For, ast.AsyncFor)):
+                value_node = assign_node.iter
+            else:
+                value_node = getattr(assign_node, "value", None)
             if not value_node:
                 continue
             rhs_str = ast.dump(value_node).lower()
@@ -306,23 +313,48 @@ class PythonParser(LanguageParser):
             )
             assign_line = getattr(assign_node, "lineno", 0)
             enclosing = self._enclosing(assign_line, fn_ranges, module_id)
-            targets = assign_node.targets if isinstance(assign_node, ast.Assign) else [assign_node.target]
+            if isinstance(assign_node, ast.Assign):
+                targets = assign_node.targets
+            else:
+                targets = [assign_node.target]
             new_target_ids: List[str] = []
             for target in targets:
-                for sub_targ in ast.walk(target):
-                    if isinstance(sub_targ, ast.Name) and isinstance(sub_targ.ctx, ast.Store):
-                        var_name = sub_targ.id
-                        ssa_label = var_name if self.options.quick_mode else self.ssa.get_versioned_id(var_name)
-                        var_id = self._make_id(path, ssa_label)
-                        self.nodes[var_id] = self._make_node(var_id, NodeType.VARIABLE, ssa_label, path, assign_line)
+                for label in self._store_targets(target):
+                    if "." in label:
+                        # An attribute write. Keyed by the whole expression and
+                        # not SSA-versioned, which is what `_reference_id` does
+                        # for a read of the same expression -- so `self.cmd`
+                        # written in one method is the node `self.cmd` read in
+                        # another. Function-local versioning would have kept
+                        # them apart.
+                        var_id = self._make_id(path, label)
+                        if var_id not in self.nodes:
+                            self.nodes[var_id] = self._make_node(
+                                var_id, NodeType.DATA, label, path, assign_line
+                            )
+                            self.nodes[var_id].metadata.update(
+                                {"expression": label, "symbol": label, "scope": "field"}
+                            )
                         if is_source:
                             self.nodes[var_id].is_unsafe = True
-                        self.edges.append(self._edge(enclosing, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "assignment"}))
-                        prev_ver_num = self.ssa.counters.get(var_name, 0) - 1
-                        if not self.options.quick_mode and prev_ver_num > 0:
-                            prev_label = f"{var_name}_v{prev_ver_num}"
-                            self.edges.append(self._edge(self._make_id(path, prev_label), var_id, EdgeRelation.DATAFLOW, {"flow_kind": "ssa"}))
+                            self.nodes[var_id].metadata["is_taint_source"] = True
+                        self.edges.append(
+                            self._edge(enclosing, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "assignment"})
+                        )
                         new_target_ids.append(var_id)
+                        continue
+                    var_name = label
+                    ssa_label = var_name if self.options.quick_mode else self.ssa.get_versioned_id(var_name)
+                    var_id = self._make_id(path, ssa_label)
+                    self.nodes[var_id] = self._make_node(var_id, NodeType.VARIABLE, ssa_label, path, assign_line)
+                    if is_source:
+                        self.nodes[var_id].is_unsafe = True
+                    self.edges.append(self._edge(enclosing, var_id, EdgeRelation.DATAFLOW, {"flow_kind": "assignment"}))
+                    prev_ver_num = self.ssa.counters.get(var_name, 0) - 1
+                    if not self.options.quick_mode and prev_ver_num > 0:
+                        prev_label = f"{var_name}_v{prev_ver_num}"
+                        self.edges.append(self._edge(self._make_id(path, prev_label), var_id, EdgeRelation.DATAFLOW, {"flow_kind": "ssa"}))
+                    new_target_ids.append(var_id)
             # References that are only arguments to a call in the value must not
             # get a direct edge to the target: the value they contribute passes
             # *through* that call. Linking them directly created a shortcut
@@ -491,6 +523,37 @@ class PythonParser(LanguageParser):
             elif isinstance(sub_node, ast.Name) and isinstance(sub_node.ctx, ast.Load):
                 refs.add(sub_node.id)
         return sorted(refs, key=lambda item: (item.count("."), item))
+
+    @classmethod
+    def _store_targets(cls, target: ast.AST) -> List[str]:
+        """Labels an assignment writes to.
+
+        Only bare names used to be recognised, because ``ast.walk`` on an
+        attribute or subscript target reaches its base in *Load* context and
+        matches nothing. Three shapes matter:
+
+        ``x = ...``            -> ``x``.
+        ``self.cmd = ...``     -> ``self.cmd``, so a handler that stashes
+                                  request data on the instance and a method
+                                  that later uses it share one node.
+        ``opts['k'] = ...``    -> ``opts``. The container is what downstream
+                                  code reads; which key comes back out is a
+                                  constant-propagation question this engine
+                                  does not answer, so the whole container
+                                  carries the taint.
+        """
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Attribute):
+            name = cls._expr_name(target)
+            return [name] if name else []
+        if isinstance(target, ast.Subscript):
+            return cls._store_targets(target.value)
+        if isinstance(target, ast.Starred):
+            return cls._store_targets(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [label for element in target.elts for label in cls._store_targets(element)]
+        return []
 
     @staticmethod
     def _enclosing(line: int, fn_ranges: List[Tuple[int, int, str]], fallback: str) -> str:
