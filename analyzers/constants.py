@@ -48,6 +48,9 @@ _STRING_METHODS = {
     "endswith", "isempty", "concat", "tostring", "replace",
 }
 
+#: `$name` and `$name[key]` -- PHP, shell and Perl interpolate without braces.
+_UNBRACED_INTERPOLATION = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+
 _TRUE_TOKENS = frozenset({"true", "True", "TRUE"})
 _FALSE_TOKENS = frozenset({"false", "False", "FALSE"})
 
@@ -147,8 +150,19 @@ class ConstantFolder:
             return None
         if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
             body = text[1:-1]
-            # An interpolation makes the literal a runtime value, not a constant.
-            if "${" in body or "$(" in body or ("{" in body and "}" in body and text[0] != "'"):
+            # An interpolation makes the literal a runtime value, not a
+            # constant. Single quotes interpolate in no language here, so they
+            # are exempt; everything else is checked, including the *unbraced*
+            # `$name` form. Missing that read PHP's "WHERE n = '$c'" as fixed
+            # text and reported a template with no holes -- which the boundary
+            # layer treats as proof of safety. A false constant here becomes a
+            # false "not injectable" there, so this check has to be strict.
+            if text[0] != "'" and (
+                "${" in body
+                or "$(" in body
+                or _UNBRACED_INTERPOLATION.search(body)
+                or ("{" in body and "}" in body)
+            ):
                 return UNKNOWN
             return self._unescape(body)
         if _INT_PATTERN.match(text):

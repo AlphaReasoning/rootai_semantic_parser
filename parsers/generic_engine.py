@@ -71,8 +71,18 @@ _INTERPOLATION_NODES: FrozenSet[str] = frozenset(
         "simple_expansion", "expansion", "command_substitution",
         "string_expansion", "substitution", "interpolated_string_expression",
         "subshell", "arithmetic_expansion",
+        # Only ever consulted *inside* a literal, where a variable reference is
+        # by definition an interpolation. PHP's `"WHERE n = $name"` embeds a
+        # bare `variable_name`, and missing it would render the whole string as
+        # fixed text -- a template with no holes, which this layer reads as
+        # proof of safety.
+        "variable_name",
     }
 )
+
+#: A bare variable reference, in any of the sigil styles used across the
+#: supported languages.
+_PLAIN_NAME = re.compile(r"^[$@]?[A-Za-z_][A-Za-z0-9_]*$")
 
 #: Scope key standing in for "declared on the object, not in this function".
 #: Fields outlive the method that writes them, so a write in one method and a
@@ -135,6 +145,19 @@ class LanguageProfile:
                 "nil",
                 "boolean",
                 "comment",
+                # Interpolated forms are literals with holes in them, not
+                # opaque values: `SELECT ... ORDER BY ${col}` must be split,
+                # or the whole query collapses into one hole and the position
+                # of `col` becomes unknowable.
+                "template_string",
+                "template_literal",
+                "string_literal_expression",
+                # PHP double-quoted strings and heredocs. Missing these made a
+                # concatenated query collapse into holes with no syntax, so the
+                # position of every value in it became unknowable.
+                "encapsed_string",
+                "heredoc",
+                "heredoc_body",
             }
         )
     )
@@ -240,6 +263,10 @@ class GenericTreeSitterParser(TreeSitterParser):
         #: it. Populated in source order as bindings are visited, and cleared
         #: for a name as soon as it is assigned something not constant.
         self._constants: Dict[Tuple[str, str], Any] = {}
+        #: (scope, name) -> the string template that name was built from, so a
+        #: sink handed a variable can still be told what the consuming parser
+        #: will see. `sql = "..." + p; execute(sql)` is the ordinary shape.
+        self._templates: Dict[Tuple[str, str], Any] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -272,6 +299,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         # declaration may sit below the method that writes it.
         self._field_names = self._collect_field_names(tree.root_node, source)
         self._constants = {}
+        self._templates = {}
         self._root_node = tree.root_node
         self._assignment_targets = self._collect_assignment_targets(tree.root_node)
 
@@ -324,6 +352,163 @@ class GenericTreeSitterParser(TreeSitterParser):
 
         for child in self._live_children(node, src, fn_id):
             self._walk(child, src, path, parent_id, fn_id)
+
+    # ------------------------------------------------------------------
+    # String reconstruction
+    # ------------------------------------------------------------------
+
+    #: Operators that join text. Everything else terminates reconstruction,
+    #: because `a - b` on strings is not concatenation in any language here.
+    _CONCAT_OPERATORS = frozenset({"+", ".", "..", "&", "+=", ".=", "||"})
+
+    def _build_template(self, node, src: str, fn_id: str, depth: int = 0):
+        """Rebuild the string ``node`` evaluates to, as literals plus holes.
+
+        This is what makes grammatical position knowable. The consuming parser
+        never sees `"SELECT ... " + name`; it sees the string that expression
+        produces, and whether `name` lands inside quotes or in an ORDER BY
+        target is the difference between "escape it" and "escaping cannot help".
+
+        Unknown constructs become a single hole rather than an error, and the
+        template is marked incomplete. An incomplete template still pins the
+        position of the holes it did recover; it just cannot be trusted to
+        prove safety, which :meth:`_boundary_metadata` enforces.
+        """
+        from analyzers.boundaries import StringTemplate
+
+        template = StringTemplate()
+        self._extend_template(template, node, src, fn_id, depth)
+        return template
+
+    def _extend_template(self, template, node, src: str, fn_id: str, depth: int) -> None:
+        if node is None or depth > 12:
+            if node is not None:
+                template.add_hole(self._get_text(src, node)[:80])
+                template.complete = False
+            return
+
+        node_type = node.type
+
+        # A value the folder can evaluate is fixed text however it was written,
+        # which is how a chain of individually harmless assignments turns out to
+        # contribute no attacker control at all.
+        folded = self._folder.value(node, src, self._scope_constants(fn_id))
+        if folded is not UNKNOWN and isinstance(folded, (str, int, float, bool)):
+            template.add_literal(str(folded))
+            return
+
+        # Wrappers that carry no value of their own. PHP and Ruby wrap each
+        # actual argument in an `argument` node, so reading position N gives a
+        # wrapper rather than the expression, and the template collapsed to a
+        # single opaque hole.
+        if "parenthesized" in node_type or node_type in {
+            "argument", "keyword_argument", "spread_element", "expression_statement",
+        }:
+            named = [child for child in node.children if child.is_named]
+            if len(named) == 1:
+                self._extend_template(template, named[0], src, fn_id, depth + 1)
+                return
+
+        if node_type.endswith("binary_expression") or node_type in {"binary_operator", "concatenation"}:
+            operands = [child for child in node.children if child.is_named]
+            operators = [
+                self._get_text(src, child).strip()
+                for child in node.children
+                if not child.is_named and self._get_text(src, child).strip()
+            ]
+            joins_text = node_type == "concatenation" or (
+                operators and all(op in self._CONCAT_OPERATORS for op in operators)
+            )
+            if joins_text and len(operands) >= 2:
+                for operand in operands:
+                    self._extend_template(template, operand, src, fn_id, depth + 1)
+                return
+
+        if node_type in self.profile.literal_nodes:
+            self._extend_literal(template, node, src, fn_id, depth)
+            return
+
+        # Anything else -- an identifier, a call, a subscript -- is a runtime
+        # value. A plain name may still resolve to a template built earlier,
+        # which is what lets `sql = "..." + p; execute(sql)` be analysed at all.
+        #
+        # Matched on the text rather than the node type: PHP spells a variable
+        # `variable_name` wrapping a `name`, Bash uses `variable_name` too, and
+        # neither is in the profile's identifier set, so a type test silently
+        # lost the indirection in exactly the languages that need it most.
+        text = self._get_text(src, node).strip()
+        if _PLAIN_NAME.match(text):
+            name = text.lstrip("$@")
+            recorded = self._templates.get((fn_id, name)) or self._templates.get((_FIELD_SCOPE, name))
+            if recorded is not None:
+                template.segments.extend(recorded.segments)
+                template.complete = template.complete and recorded.complete
+                return
+        template.add_hole(text[:80])
+
+    def _extend_literal(self, template, node, src: str, fn_id: str, depth: int) -> None:
+        """Split a literal into its fixed text and its interpolations.
+
+        `f"ls {path}"` and `` `SELECT ${col} FROM t` `` are templates already;
+        treating the whole literal as fixed text would hide the hole, and
+        treating it as a hole would lose the surrounding syntax that decides
+        the position.
+        """
+        interpolations = [
+            child
+            for child in self._iter_all(node, include_self=False)
+            if child.type in _INTERPOLATION_NODES
+        ]
+        if not interpolations:
+            template.add_literal(self._unquote(self._get_text(src, node)))
+            return
+
+        interpolations.sort(key=lambda child: child.start_byte)
+        cursor = node.start_byte
+        raw = src.encode("utf-8")
+        for child in interpolations:
+            before = raw[cursor : child.start_byte].decode("utf-8", "replace")
+            # Only the delimiter comes off, never surrounding whitespace:
+            # `ORDER BY ${col}` must keep the space or the rendered template
+            # reads `ORDER BYROOTAIHOLE0` and the grammar sees one identifier.
+            # Leading delimiter only. The chunk before an interpolation often
+            # *ends* in a quote that belongs to the embedded language --
+            # `"... WHERE n = '$c'"` -- and stripping it moved the hole from a
+            # quoted literal to a bare operand, inverting the required defence.
+            template.add_literal(
+                self._strip_delimiters(before, trailing=False)
+                if cursor == node.start_byte
+                else before
+            )
+            template.add_hole(self._get_text(src, child)[:80])
+            cursor = child.end_byte
+        tail = raw[cursor : node.end_byte].decode("utf-8", "replace")
+        template.add_literal(self._strip_delimiters(tail, leading=False))
+
+    @staticmethod
+    def _strip_delimiters(text: str, leading: bool = True, trailing: bool = True) -> str:
+        """Remove string delimiters and any prefix sigil, preserving whitespace."""
+        result = text
+        if leading:
+            index = 0
+            while index < len(result) and result[index] in "fFrRbBuU@$":
+                index += 1
+            if index < len(result) and result[index] in "\"'`":
+                result = result[index + 1 :]
+        if trailing and result and result[-1] in "\"'`":
+            result = result[:-1]
+        return result
+
+    @staticmethod
+    def _unquote(text: str) -> str:
+        stripped = text.strip()
+        for prefix in ("f", "r", "b", "rb", "br", "u", "$", "@"):
+            if stripped[: len(prefix)].lower() == prefix and len(stripped) > len(prefix):
+                stripped = stripped[len(prefix) :]
+                break
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "\"'`":
+            return stripped[1:-1]
+        return stripped.lstrip("\"'`").rstrip("\"'`")
 
     def _visit_foreach(self, node, src: str, path: str, fn_id: str) -> None:
         """Bind a loop variable to the collection it iterates.
@@ -571,6 +756,26 @@ class GenericTreeSitterParser(TreeSitterParser):
         else:
             self._constants[key] = value
 
+    def _record_template(self, name: str, scope: str, fn_id: str, value_nodes: List[Any], src: str) -> None:
+        """Remember the string ``name`` was built from, or forget it.
+
+        Sinks are almost never handed a literal. `sql = "..." + p;
+        execute(sql)` is the ordinary shape, so without this the consuming
+        parser would only ever be shown a bare identifier and every position
+        would be unknown.
+        """
+        key = (_FIELD_SCOPE if scope == _FIELD_SCOPE else fn_id, name)
+        if len(value_nodes) != 1:
+            self._templates.pop(key, None)
+            return
+        template = self._build_template(value_nodes[0], src, fn_id)
+        # A template that is nothing but one hole says nothing the sink did not
+        # already know, and keeping it would only chain holes together.
+        if len(template.segments) == 1 and template.segments[0][0] == "hole":
+            self._templates.pop(key, None)
+            return
+        self._templates[key] = template
+
     def _visit_binding(self, node, src: str, path: str, fn_id: str) -> None:
         """Create the bound variable and connect the value side to it."""
         target_nodes, value_nodes = self._split_on_assignment(node)
@@ -650,6 +855,7 @@ class GenericTreeSitterParser(TreeSitterParser):
                 self._pending_function_name = None
             lineno = node.start_point[0] + 1
             self._record_constant(name, target_scope, fn_id, value_nodes, src)
+            self._record_template(name, target_scope, fn_id, value_nodes, src)
             var_id = self._declare_value(name, path, fn_id, lineno, "binding", target_scope)
             if is_source:
                 self.nodes[var_id].is_unsafe = True
@@ -746,9 +952,51 @@ class GenericTreeSitterParser(TreeSitterParser):
                     )
                 )
             self._note_collection_write(callee_text, argument_ids, src, fn_id)
+            if is_sink:
+                self._note_boundary(callee_id, callee_text, arguments, src, fn_id)
         self._note_receiver(callee_text, callee_id, fn_id)
         self._call_sites.append((callee_text.split(".")[-1].strip(), callee_id, argument_ids))
         return callee_id
+
+    def _note_boundary(self, callee_id: str, callee_text: str, arguments, src: str, fn_id: str) -> None:
+        """Record what the consuming parser will see at this sink.
+
+        The sink's own name says which language parses its argument; the
+        template says where the runtime values land in that language. Together
+        they answer "what defence is required here", which the sink name alone
+        never can.
+        """
+        from analyzers.boundaries import analyse, consumer_for
+
+        mapping = consumer_for(callee_text)
+        if mapping is None or arguments is None:
+            return
+        consumer, position = mapping
+        operands = [child for child in arguments.children if child.is_named]
+        if position >= len(operands):
+            return
+
+        template = self._build_template(operands[position], src, fn_id)
+        if not template.segments:
+            return
+        # A template that is nothing but one hole carries no syntax, so any
+        # position the grammar reports for it is an artifact of the probe token
+        # rather than a fact about the code. `execute(buildQuery(req))` would
+        # otherwise be claimed as an identifier position with full confidence.
+        if all(kind == "hole" for kind, _ in template.segments):
+            return
+        analysis = analyse(template.render(), consumer)
+        if analysis is None:
+            return
+
+        metadata = self.nodes[callee_id].metadata
+        metadata["boundary"] = {
+            **analysis.to_dict(),
+            **template.to_dict(),
+            # An incomplete reconstruction may have missed a hole, so it can
+            # locate danger but must never be read as proof of safety.
+            "trustworthy_safe": template.complete,
+        }
 
     def _note_receiver(self, callee_text: str, callee_id: str, fn_id: str) -> None:
         """A method's result derives from the object it was called on.

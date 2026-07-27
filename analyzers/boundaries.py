@@ -46,6 +46,63 @@ def hole_token(index: int) -> str:
     return f"{HOLE_PREFIX}{index}"
 
 
+@dataclass
+class StringTemplate:
+    """What the host language builds, split into fixed text and runtime values.
+
+    ``"SELECT * FROM t WHERE n = '" + name + "'"`` becomes three segments: two
+    literals and one hole. Rendering substitutes a probe token for each hole so
+    the consumer's grammar can be asked where that value lands.
+
+    ``complete`` is false when reconstruction gave up part way -- a helper call
+    it could not follow, a loop-built string, a format it does not model. The
+    template is still worth analysing (an incomplete prefix often pins the
+    position exactly), but a *safe* verdict from an incomplete template is not
+    trustworthy and callers must not act on one.
+    """
+
+    #: ``("lit", text)`` or ``("hole", source expression)``, in order.
+    segments: List[Tuple[str, str]] = field(default_factory=list)
+    complete: bool = True
+
+    def add_literal(self, text: str) -> None:
+        if not text:
+            return
+        if self.segments and self.segments[-1][0] == "lit":
+            kind, previous = self.segments[-1]
+            self.segments[-1] = (kind, previous + text)
+        else:
+            self.segments.append(("lit", text))
+
+    def add_hole(self, expression: str) -> None:
+        self.segments.append(("hole", expression))
+
+    @property
+    def hole_expressions(self) -> List[str]:
+        return [text for kind, text in self.segments if kind == "hole"]
+
+    def render(self) -> str:
+        parts: List[str] = []
+        index = 0
+        for kind, text in self.segments:
+            if kind == "lit":
+                parts.append(text)
+            else:
+                parts.append(hole_token(index))
+                index += 1
+        return "".join(parts)
+
+    def to_dict(self) -> Dict:
+        # `hole_expressions`, not `holes`: the analysis emits `holes` as
+        # classified positions, and merging the two dicts silently replaced
+        # them with bare source strings.
+        return {
+            "template": self.render()[:400],
+            "complete": self.complete,
+            "hole_expressions": self.hole_expressions[:12],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Defences
 # ---------------------------------------------------------------------------
@@ -272,6 +329,75 @@ CONSUMERS: Dict[str, Consumer] = {
     "shell": Consumer("shell", "bash", SHELL_RULES),
     "html": Consumer("html", "html", HTML_RULES),
 }
+
+
+# ---------------------------------------------------------------------------
+# Which grammar consumes which sink
+# ---------------------------------------------------------------------------
+
+#: Sink name fragment -> the language that parses its argument.
+#:
+#: This is the piece a flat sink list cannot express. `executeQuery` and
+#: `execSync` are both "dangerous", but one hands its argument to a SQL parser
+#: and the other to a shell, and the defence that works for one is inert for
+#: the other. Matching is on lowercased segments of the callee expression, so
+#: `connection.prepareStatement` and `db.sequelize.query` both resolve.
+#:
+#: The second element is which argument is consumed. It is not always the
+#: first: `mysqli_query($link, $sql)` and `pg_query($conn, $sql)` take the
+#: connection first, and reading position 0 there analyses the handle instead
+#: of the query.
+SINK_CONSUMERS: Dict[str, Tuple[str, int]] = {
+    # SQL
+    "executequery": ("sql", 0), "executeupdate": ("sql", 0), "preparestatement": ("sql", 0),
+    "createquery": ("sql", 0), "rawquery": ("sql", 0), "nativequery": ("sql", 0),
+    "cursor.execute": ("sql", 0), "conn.execute": ("sql", 0), "connection.execute": ("sql", 0),
+    "session.execute": ("sql", 0), "stmt.execute": ("sql", 0), "statement.execute": ("sql", 0),
+    "db.query": ("sql", 0), "db.exec": ("sql", 0), "sequelize.query": ("sql", 0),
+    "knex.raw": ("sql", 0), "mysqli_query": ("sql", 1), "pg_query": ("sql", 1),
+    "sqlx::query": ("sql", 0), "sqlcommand": ("sql", 0),
+    # Shell
+    "os.system": ("shell", 0), "subprocess.run": ("shell", 0), "subprocess.call": ("shell", 0),
+    "popen": ("shell", 0), "execsync": ("shell", 0), "spawnsync": ("shell", 0),
+    "child_process.exec": ("shell", 0), "shell_exec": ("shell", 0), "proc_open": ("shell", 0),
+    "system": ("shell", 0), "runtime.exec": ("shell", 0), "processbuilder": ("shell", 0),
+    "os.execute": ("shell", 0), "io.popen": ("shell", 0), "kernel.system": ("shell", 0),
+    "invoke-expression": ("shell", 0), "process.start": ("shell", 0),
+    # HTML
+    "innerhtml": ("html", 0), "outerhtml": ("html", 0), "insertadjacenthtml": ("html", 0),
+    "document.write": ("html", 0), "dangerouslysetinnerhtml": ("html", 0),
+    "getwriter.println": ("html", 0), "getwriter.write": ("html", 0), "getwriter.print": ("html", 0),
+    "res.send": ("html", 0), "res.write": ("html", 0), "render_template_string": ("html", 0),
+}
+
+#: Sinks whose argument is not parsed as another language at all. Recorded so
+#: an unmapped sink is a known gap rather than an oversight.
+UNMAPPED_SINKS: Dict[str, str] = {
+    "pickle.loads": "deserialization; the payload is an object graph, not a grammar this models",
+    "yaml.load": "deserialization; same",
+    "eval": "the host language parses it; a host-grammar consumer, not yet modelled",
+    "strcpy": "memory safety, not a parser boundary",
+    "fs.readfile": "path resolution; needs a path-normalisation model rather than a grammar",
+    "urlopen": "URL parsing; belongs with the differential analysis layer",
+}
+
+
+def consumer_for(sink_label: str) -> Optional[Tuple[str, int]]:
+    """``(consumer, argument index)`` for ``sink_label``, if it is one we model.
+
+    Longest match wins, so `child_process.exec` beats a bare `exec` and
+    `getWriter.println` is not confused with an arbitrary `println`.
+    """
+    # Method-chain sinks are written `response.getWriter().println`, so the
+    # empty argument list has to come out before fragment matching or
+    # `getwriter.println` never matches.
+    lowered = str(sink_label).lower().replace("()", "")
+    best: Optional[Tuple[str, int]] = None
+    best_length = 0
+    for fragment, mapping in SINK_CONSUMERS.items():
+        if fragment in lowered and len(fragment) > best_length:
+            best, best_length = mapping, len(fragment)
+    return best
 
 
 # ---------------------------------------------------------------------------
