@@ -1,0 +1,219 @@
+{
+  "corpus": "dsvw",
+  "primary_language": "python",
+  "parser_tier": "real",
+  "ground_truth_source": "CASES table in dsvw.py plus the handler lines it refers to",
+  "entries": [
+    {
+      "id": "Blind SQL Injection (boolean)",
+      "file": "dsvw.py",
+      "line_start": 30,
+      "line_end": 30,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"id\"]"
+    },
+    {
+      "id": "Blind SQL Injection (time)",
+      "file": "dsvw.py",
+      "line_start": 30,
+      "line_end": 30,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"id\"]"
+    },
+    {
+      "id": "UNION SQL Injection",
+      "file": "dsvw.py",
+      "line_start": 30,
+      "line_end": 30,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"id\"]"
+    },
+    {
+      "id": "Login Bypass",
+      "file": "dsvw.py",
+      "line_start": 67,
+      "line_end": 67,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params.get(\"password\", \"\")"
+    },
+    {
+      "id": "Cross Site Scripting (reflected)",
+      "file": "dsvw.py",
+      "line_start": 33,
+      "line_end": 33,
+      "cwe": "CWE-79",
+      "vuln_class": "xss",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"v\"]"
+    },
+    {
+      "id": "Cross Site Scripting (stored)",
+      "file": "dsvw.py",
+      "line_start": 50,
+      "line_end": 50,
+      "cwe": "CWE-79",
+      "vuln_class": "xss",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"comment\"]"
+    },
+    {
+      "id": "Cross Site Scripting (JSONP)",
+      "file": "dsvw.py",
+      "line_start": 65,
+      "line_end": 65,
+      "cwe": "CWE-79",
+      "vuln_class": "xss",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"callback\"]"
+    },
+    {
+      "id": "XML External Entity (local)",
+      "file": "dsvw.py",
+      "line_start": 41,
+      "line_end": 41,
+      "cwe": "CWE-611",
+      "vuln_class": "xxe",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"xml\"]"
+    },
+    {
+      "id": "Server Side Request Forgery",
+      "file": "dsvw.py",
+      "line_start": 37,
+      "line_end": 37,
+      "cwe": "CWE-918",
+      "vuln_class": "ssrf",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"path\"]"
+    },
+    {
+      "id": "Blind XPath Injection (boolean)",
+      "file": "dsvw.py",
+      "line_start": 43,
+      "line_end": 43,
+      "cwe": "CWE-643",
+      "vuln_class": "xpathi",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"name\"]"
+    },
+    {
+      "id": "Unvalidated Redirect",
+      "file": "dsvw.py",
+      "line_start": 61,
+      "line_end": 61,
+      "cwe": "CWE-601",
+      "vuln_class": "open-redirect",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"redir\"]"
+    },
+    {
+      "id": "Arbitrary Code Execution",
+      "file": "dsvw.py",
+      "line_start": 39,
+      "line_end": 39,
+      "cwe": "CWE-78",
+      "vuln_class": "cmdi",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"domain\"]"
+    },
+    {
+      "id": "Path Traversal",
+      "file": "dsvw.py",
+      "line_start": 37,
+      "line_end": 37,
+      "cwe": "CWE-22",
+      "vuln_class": "pathtraver",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"path\"]"
+    },
+    {
+      "id": "File Inclusion (remote)",
+      "file": "dsvw.py",
+      "line_start": 56,
+      "line_end": 56,
+      "cwe": "CWE-98",
+      "vuln_class": "rfi",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"include\"]"
+    },
+    {
+      "id": "Component with Known Vulnerability (pickle)",
+      "file": "dsvw.py",
+      "line_start": 35,
+      "line_end": 35,
+      "cwe": "CWE-502",
+      "vuln_class": "deserialization",
+      "source_doc": "dsvw.py CASES table",
+      "confidence": "high",
+      "anchor": "params[\"object\"]"
+    }
+  ],
+  "excluded": [
+    {
+      "id": "Cross Site Request Forgery",
+      "reason": "a missing token, not a data flow"
+    },
+    {
+      "id": "Clickjacking",
+      "reason": "a missing response header, not a data flow"
+    },
+    {
+      "id": "Frame Injection (phishing)",
+      "reason": "a rendering-context issue in the HTML template"
+    },
+    {
+      "id": "Frame Injection (content spoofing)",
+      "reason": "a rendering-context issue in the HTML template"
+    },
+    {
+      "id": "Cross Site Scripting (DOM)",
+      "reason": "occurs in client-side JavaScript served as a string"
+    },
+    {
+      "id": "HTTP Parameter Pollution",
+      "reason": "a parsing-semantics issue, not a sink"
+    },
+    {
+      "id": "Denial of Service (memory)",
+      "reason": "resource exhaustion, not injection"
+    },
+    {
+      "id": "Full Path Disclosure",
+      "reason": "an error-handling disclosure, not a sink"
+    },
+    {
+      "id": "Source Code Disclosure",
+      "reason": "same sink as Path Traversal; would double-count"
+    },
+    {
+      "id": "XML External Entity (remote)",
+      "reason": "same sink as XXE (local); would double-count"
+    },
+    {
+      "id": "HTTP Header Injection (phishing)",
+      "reason": "reaches send_header, which the tool does not model as a sink"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "corpus": "nodegoat",
+  "primary_language": "javascript",
+  "parser_tier": "real",
+  "ground_truth_source": "app/views/tutorial/*.html -- the tutorial served by the app itself",
+  "entries": [
+    {
+      "id": "a1:code-injection",
+      "file": "app/routes/contributions.js",
+      "line_start": 32,
+      "line_end": 34,
+      "cwe": "CWE-94",
+      "vuln_class": "code-injection",
+      "source_doc": "app/views/tutorial/a1.html",
+      "confidence": "high",
+      "anchor": "= eval(req.body."
+    },
+    {
+      "id": "ssrf:ssrf",
+      "file": "app/routes/research.js",
+      "line_start": 16,
+      "line_end": 16,
+      "cwe": "CWE-918",
+      "vuln_class": "ssrf",
+      "source_doc": "app/views/tutorial/ssrf.html",
+      "confidence": "high",
+      "anchor": "needle.get(url"
+    },
+    {
+      "id": "a1:nosqli",
+      "file": "app/data/allocations-dao.js",
+      "line_start": 73,
+      "line_end": 78,
+      "cwe": "CWE-943",
+      "vuln_class": "nosqli",
+      "source_doc": "app/views/tutorial/a1.html",
+      "confidence": "high",
+      "anchor": "$where"
+    }
+  ],
+  "excluded": [
+    {
+      "id": "a2 Broken Authentication",
+      "reason": "session and password handling, not a data flow to a sink"
+    },
+    {
+      "id": "a3 Sensitive Data Exposure",
+      "reason": "storage and transport choices, not a sink"
+    },
+    {
+      "id": "a4 XXE",
+      "reason": "no XML parser reachable from request data in this codebase"
+    },
+    {
+      "id": "a5 Broken Access Control",
+      "reason": "a missing check, not a data flow"
+    },
+    {
+      "id": "a6 Security Misconfiguration",
+      "reason": "configuration, not code dataflow"
+    },
+    {
+      "id": "a7 XSS",
+      "reason": "rendered through templates; the tutorial does not name a sink line"
+    },
+    {
+      "id": "a8 CSRF",
+      "reason": "a missing token, not a data flow"
+    },
+    {
+      "id": "a9 Known Vulnerable Components",
+      "reason": "a dependency version, not a data flow"
+    },
+    {
+      "id": "a10 Insufficient Logging",
+      "reason": "an absence of code, not a sink"
+    },
+    {
+      "id": "redos",
+      "reason": "algorithmic complexity, not injection"
+    }
+  ]
+}

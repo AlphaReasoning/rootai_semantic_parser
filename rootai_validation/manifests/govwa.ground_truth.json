@@ -1,0 +1,73 @@
+{
+  "corpus": "govwa",
+  "primary_language": "go",
+  "parser_tier": "real",
+  "ground_truth_source": "vulnerability/<class>/ directory names, as the project organises them",
+  "entries": [
+    {
+      "id": "sqli:function",
+      "file": "vulnerability/sqli/function.go",
+      "line_start": null,
+      "line_end": null,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "repository layout: vulnerability/<class>/",
+      "confidence": "low",
+      "anchor": null
+    },
+    {
+      "id": "sqli:sqli",
+      "file": "vulnerability/sqli/sqli.go",
+      "line_start": null,
+      "line_end": null,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "repository layout: vulnerability/<class>/",
+      "confidence": "low",
+      "anchor": null
+    },
+    {
+      "id": "xss:function",
+      "file": "vulnerability/xss/function.go",
+      "line_start": null,
+      "line_end": null,
+      "cwe": "CWE-79",
+      "vuln_class": "xss",
+      "source_doc": "repository layout: vulnerability/<class>/",
+      "confidence": "low",
+      "anchor": null
+    },
+    {
+      "id": "xss:xss",
+      "file": "vulnerability/xss/xss.go",
+      "line_start": null,
+      "line_end": null,
+      "cwe": "CWE-79",
+      "vuln_class": "xss",
+      "source_doc": "repository layout: vulnerability/<class>/",
+      "confidence": "low",
+      "anchor": null
+    },
+    {
+      "id": "xxe:xxe",
+      "file": "vulnerability/xxe/xxe.go",
+      "line_start": null,
+      "line_end": null,
+      "cwe": "CWE-611",
+      "vuln_class": "xxe",
+      "source_doc": "repository layout: vulnerability/<class>/",
+      "confidence": "low",
+      "anchor": null
+    }
+  ],
+  "excluded": [
+    {
+      "id": "idor",
+      "reason": "an authorisation check, not a source-to-sink data flow"
+    },
+    {
+      "id": "csa",
+      "reason": "client-side session attack; not a sink the tool models"
+    }
+  ]
+}

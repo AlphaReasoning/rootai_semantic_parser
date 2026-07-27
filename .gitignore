@@ -13,3 +13,10 @@ dist/
 .streamlit/secrets.toml
 .env
 .env.*
+
+# Validation harness: clones, venv and scan outputs are reproducible, not source.
+rootai_validation/corpora/
+rootai_validation/.venv/
+rootai_validation/scans/
+rootai_validation/smoke/
+rootai_validation/env/

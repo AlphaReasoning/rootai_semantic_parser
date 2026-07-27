@@ -1,0 +1,64 @@
+{
+  "corpus": "dvna",
+  "primary_language": "javascript",
+  "parser_tier": "real",
+  "ground_truth_source": "docs/solution/*.md -- each names the file and quotes the vulnerable line",
+  "entries": [
+    {
+      "id": "a1-injection:sqli",
+      "file": "core/appHandler.js",
+      "line_start": 10,
+      "line_end": 10,
+      "cwe": "CWE-89",
+      "vuln_class": "sqli",
+      "source_doc": "docs/solution/a1-injection.md",
+      "confidence": "high",
+      "anchor": "SELECT name,id FROM Users WHERE login="
+    },
+    {
+      "id": "a1-injection:cmdi",
+      "file": "core/appHandler.js",
+      "line_start": 39,
+      "line_end": 39,
+      "cwe": "CWE-78",
+      "vuln_class": "cmdi",
+      "source_doc": "docs/solution/a1-injection.md",
+      "confidence": "high",
+      "anchor": "exec('ping -c 2 '"
+    },
+    {
+      "id": "a4-xxe:xxe",
+      "file": "core/appHandler.js",
+      "line_start": 235,
+      "line_end": 235,
+      "cwe": "CWE-611",
+      "vuln_class": "xxe",
+      "source_doc": "docs/solution/a4-xxe.md",
+      "confidence": "high",
+      "anchor": "libxmljs.parseXmlString("
+    },
+    {
+      "id": "a8-insecure-deserialization:deserialization",
+      "file": "core/appHandler.js",
+      "line_start": 218,
+      "line_end": 218,
+      "cwe": "CWE-502",
+      "vuln_class": "deserialization",
+      "source_doc": "docs/solution/a8-insecure-deserialization.md",
+      "confidence": "high",
+      "anchor": "serialize.unserialize"
+    },
+    {
+      "id": "ax-unvalidated-redirects-and-forwards:open-redirect",
+      "file": "core/appHandler.js",
+      "line_start": 188,
+      "line_end": 188,
+      "cwe": "CWE-601",
+      "vuln_class": "open-redirect",
+      "source_doc": "docs/solution/ax-unvalidated-redirects-and-forwards.md",
+      "confidence": "high",
+      "anchor": "res.redirect(req.query.url)"
+    }
+  ],
+  "excluded": []
+}
