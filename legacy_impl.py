@@ -103,7 +103,7 @@ def run_self_tests() -> int:
             report = parser.scan(taint_config=TaintConfig.profile("bugbounty"))
             bounty = build_bounty_report(report, profile="bugbounty", quick_mode=True)
             markdown = bounty_report_to_markdown_table(bounty)
-            self.assertIn("| Score | Severity | Impact |", markdown)
+            self.assertIn("| Score | Confidence | Severity | Potential Impact |", markdown)
 
         def test_framework_entrypoint_patterns(self) -> None:
             fixtures = {
