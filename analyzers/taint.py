@@ -541,6 +541,7 @@ class TaintAnalyzer:
             score -= 30.0
         if auth_guarded:
             score -= 15.0
+        was_sanitized = sanitized
         if sanitized:
             score -= 20.0
         if self.options.suppress_test_files and is_test_path:
@@ -561,6 +562,21 @@ class TaintAnalyzer:
                 sanitized = False
             elif boundary["outcome"] == "SAFE" and boundary["trustworthy_safe"]:
                 sanitized = True
+
+        differential = self._differential(nodes, sink_node, labels, validation_guards)
+        if differential is not None:
+            # A check that a divergent sink can bypass does not defend the flow.
+            # This is the highest-signal downgrade-reversal there is: the code
+            # *looks* validated, which is exactly why the bug ships. Re-surface
+            # the finding and name the more specific impact.
+            if differential["defeats_guard"]:
+                # Undo the guard's downgrade (it does not actually defend this
+                # flow) and add a signal bump on top, so a bypassable check does
+                # not leave the finding buried below the reporting threshold.
+                sanitized = False
+                score += 35.0 if was_sanitized else 15.0
+            impact = differential["impact"]
+            potential_impact = differential["impact"]
         confidence = score / 100.0
         sanitization_status = "none_detected" if not sanitized else "sanitized_detected"
         source_label = labels[0] if labels else ""
@@ -579,17 +595,37 @@ class TaintAnalyzer:
             "confidence": max(min(confidence, 1.0), 0.0),
             "exploitability": "unconfirmed",
             "sanitization_status": sanitization_status,
+            # The effective flag after boundary and differential corrections, so
+            # the finding's `sanitized` attribute agrees with its status string.
+            # A boundary MISMATCH or a differential guard-bypass means the value
+            # is *not* actually sanitised, however the taint search scored it.
+            "sanitized": sanitized,
             "source_label": source_label,
             "sink_label": sink_label,
             "explanation": explanation,
             "routes": routes,
             "validation_guards": validation_guards,
+            "differential": differential,
             "test_only": is_test_path,
             "dead_code": dead_code,
             "library_code": is_library_path,
             "path_labels": labels,
             "boundary": boundary,
         }
+
+    def _differential(
+        self, nodes: List[Dict], sink_node: Dict, labels: List[str], guard_texts: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Detect a parser-differential bypass on this path.
+
+        A value validated by one parser and consumed by a different, divergent
+        one -- the SSRF allowlist checked with `urlparse` and fetched with a
+        client that parses the authority differently. The finding is high-signal
+        because it contradicts a defence the code appears to have.
+        """
+        from analyzers import differential as differential_kb
+
+        return differential_kb.analyse_path(guard_texts, labels, sink_node.get("label", ""))
 
     def _boundary_verdict(self, nodes: List[Dict], sink_node: Dict) -> Optional[Dict[str, Any]]:
         """Judge the sink's grammatical boundary against the defences on the path.
@@ -851,7 +887,7 @@ class TaintAnalyzer:
                         source_id=path[0],
                         sink_id=nid,
                         path=path,
-                        sanitized=sanitized,
+                        sanitized=metadata["sanitized"],
                         severity=severity,
                         reachable=metadata["reachable"],
                         auth_guarded=metadata["auth_guarded"],
@@ -871,6 +907,7 @@ class TaintAnalyzer:
                         sink_label=metadata["sink_label"],
                         explanation=metadata["explanation"],
                         boundary=metadata["boundary"],
+                        differential=metadata["differential"],
                     )
                 )
 

@@ -397,7 +397,7 @@ class TaintConfig:
             "getWriter.write", "getWriter.print", "getWriter.println",
             "getWriter.printf", "getWriter.format", "getWriter.append",
             "getOutputStream.write", "response.setHeader", "response.addHeader",
-            "response.sendRedirect",
+            "response.sendRedirect", "res.redirect", "sendRedirect",
             # --- LDAP injection ---
             "DirContext.search", "InitialDirContext.search", "LdapContext.search",
             "idc.search", "ctx.search", "ldap_search", "ldap_list",
@@ -1068,6 +1068,10 @@ class TaintPath:
     #: here" but "the hole is a single-quoted literal, so the probe is a quote
     #: break". ``None`` when no consuming grammar was identified.
     boundary: Optional[Dict[str, Any]] = None
+    #: Parser-differential bypass, when a check on this value and the sink parse
+    #: it differently (an SSRF allowlist checked with one URL parser and fetched
+    #: with another). Carries the bypass techniques. ``None`` when none was found.
+    differential: Optional[Dict[str, Any]] = None
 
     def summary(self, node_idx: Dict[str, Dict[str, Any]]) -> str:
         """Render a short path summary."""

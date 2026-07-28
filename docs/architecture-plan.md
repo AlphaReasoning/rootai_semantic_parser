@@ -234,10 +234,34 @@ judge runs unless the operator opts into the paid one.
 existing feedback tools read; ClaudeJudge failure paths covered without any
 network call.
 
-### Step 9 — Differential analysis (L3)
-Curated validator/consumer divergence table, starting with URL parsing and
-path normalisation.
-*Check*: detects the known SSRF filter-bypass shapes.
+### Step 9 — Differential analysis (L3) ✅
+`analyzers/differential.py` is a curated table of known-divergent
+`(validator, consumer)` pairs — the "discrepancies and gaps" class. It catches
+the bug that ships *because* the code looks defended: a value validated by one
+parser and consumed by another that disagrees.
+
+- **SSRF allowlist bypass** — host checked with `urlparse`/`new URL`, fetched by
+  an HTTP client that parses the authority differently (`http://allowed@evil.com`).
+- **Path traversal, check-before-normalise** — path checked for `..` before the
+  filesystem normalises it (`%2e%2e%2f`, absolute path).
+- **Open redirect** — redirect host checked, browser follows a differently-parsed
+  authority (`//evil.com`).
+
+It fires only when *both* a validator and a documented divergent consumer sit on
+the same flow, so it barely false-positives. A match **defeats the guard**: a
+value a check would otherwise mark defended is re-surfaced (`sanitized=False`,
+the guard's downgrade undone), the impact corrected, and the concrete bypass
+techniques attached. The evidence bundle carries them as a sharpened probe, so
+the downstream prober fires the exact payload rather than guessing.
+
+Deliberately a table, not a solver — general parser-disagreement detection is
+open research, and the value is concentrated in these named classes. Two calls
+recorded: `file_get_contents` stays a *source* (dual-use), so PHP SSRF through it
+isn't detected; and the Python ast engine records no guards, so the validator
+must be on the taint path there rather than in a branch condition — same class
+of Python-ast gap as the boundary layer had.
+*Check*: 415 tests; SSRF/path-traversal/open-redirect divergences detected end
+to end and defeat the guard; OWASP floor and real-target corpus unchanged.
 
 ## Position on the existing work
 

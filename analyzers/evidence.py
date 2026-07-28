@@ -43,6 +43,10 @@ class EvidenceBundle:
     reachability: Dict[str, Any]
     #: Grammar-boundary verdict, when a consuming language was identified.
     boundary: Optional[Dict[str, Any]]
+    #: Parser-differential bypass, when a check and the sink parse the value
+    #: differently (an SSRF allowlist bypass). Carries the bypass techniques a
+    #: prober fires. ``None`` when no divergence was found.
+    differential: Optional[Dict[str, Any]]
     #: Defences seen on the path and whether they fit the position.
     defences: Dict[str, Any]
 
@@ -64,6 +68,7 @@ class EvidenceBundle:
             "flow": self.flow,
             "reachability": self.reachability,
             "boundary": self.boundary,
+            "differential": self.differential,
             "defences": self.defences,
             "question": self.question,
             "probe": self.probe,
@@ -77,17 +82,29 @@ def _finding_id(finding: Dict[str, Any]) -> str:
     return f"{sink}::{source}"
 
 
-def _question_for(finding: Dict[str, Any], boundary: Optional[Dict[str, Any]]) -> str:
+def _question_for(
+    finding: Dict[str, Any],
+    boundary: Optional[Dict[str, Any]],
+    differential: Optional[Dict[str, Any]] = None,
+) -> str:
     """The one thing the confirming step should decide.
 
     Sharpened by the boundary verdict when there is one: a MISMATCH already
     knows the applied defence is the wrong kind, so the open question is only
     whether the position is reachable with a live payload, not whether it is
-    vulnerable in principle.
+    vulnerable in principle. A parser-differential bypass sharpens it further --
+    the open question is only whether the specific disagreement holds at runtime.
     """
     impact = finding.get("impact", "the sink")
     routes = finding.get("routes") or []
     where = f" via {routes[0]}" if routes else ""
+
+    if differential:
+        return (
+            f"A check validates this value but the sink parses it differently "
+            f"({differential['rationale']}). Confirm the bypass holds at runtime "
+            f"by sending one of the listed techniques."
+        )
 
     if boundary:
         outcome = boundary.get("outcome")
@@ -144,6 +161,7 @@ def _caveats(finding: Dict[str, Any], boundary: Optional[Dict[str, Any]]) -> Lis
 def build_evidence_bundle(finding: Dict[str, Any]) -> EvidenceBundle:
     """Assemble the confirmation-ready bundle for one finding."""
     boundary = finding.get("boundary")
+    diff = finding.get("differential")
     defences = {
         "applied": (boundary or {}).get("applied", []),
         "verdict": (boundary or {}).get("outcome"),
@@ -174,9 +192,16 @@ def build_evidence_bundle(finding: Dict[str, Any]) -> EvidenceBundle:
             "auth_guarded": finding.get("auth_guarded", False),
         },
         boundary=boundary,
+        differential=diff,
         defences=defences,
-        question=_question_for(finding, boundary),
-        probe=(boundary or {}).get("probe") or _fallback_probe(finding),
+        question=_question_for(finding, boundary, diff),
+        # A parser-differential bypass names the exact payloads that exploit the
+        # disagreement, which is a sharper probe than any generic hint.
+        probe=(
+            f"{diff['rationale']} -- try: {diff['techniques'][0]}"
+            if diff and diff.get("techniques")
+            else (boundary or {}).get("probe") or _fallback_probe(finding)
+        ),
         caveats=_caveats(finding, boundary),
     )
 
@@ -204,6 +229,7 @@ def build_evidence_report(findings: List[Dict[str, Any]], limit: int = 50) -> Di
                 if (bundle.boundary or {}).get("outcome") == "UNDEFENDED"
                 and (bundle.boundary or {}).get("structural")
             ),
+            "parser_differential": sum(1 for bundle in bundles if bundle.differential),
         },
         "bundles": [bundle.to_dict() for bundle in bundles],
     }
