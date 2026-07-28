@@ -239,7 +239,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if args.command == "init-project":
         from pathlib import Path
 
-        print(Path("/home/alphareasoning/rootai_semantic_parser/pyproject.toml").read_text(encoding="utf-8"))
+        print((Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8"))
         return 0
     profile_def = load_finding_profile(args.profile_file) if args.profile_file else FindingProfile.built_in(args.profile)
 

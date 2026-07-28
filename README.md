@@ -194,12 +194,12 @@ docker run --rm -p 7860:7860 rootai-semantic-parser
 
 This Space is designed to be uploaded directly from:
 
-`/home/alphareasoning/rootai_semantic_parser`
+`/home/alphareasoning/osiris/rootai_semantic_parser`
 
 Use the same direct workflow:
 
 ```bash
-cd /home/alphareasoning/rootai_semantic_parser
+cd /home/alphareasoning/osiris/rootai_semantic_parser
 hf upload alpha-reasoning/rootai-semantic-parser . . --repo-type space \
   --exclude ".venv/*" \
   --exclude "**/__pycache__/*" \
