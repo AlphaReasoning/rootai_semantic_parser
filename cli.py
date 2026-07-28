@@ -107,6 +107,26 @@ def _build_cli() -> argparse.ArgumentParser:
     explain_parser.add_argument("--out", help="Write report to file instead of stdout")
     explain_parser.add_argument("--limit", type=int, default=50, help="Max findings to bundle")
 
+    confirm_parser = sub.add_parser(
+        "confirm",
+        help="Judge candidates as confirmed/rejected/uncertain from their evidence",
+    )
+    confirm_parser.add_argument(
+        "--judge",
+        choices=["heuristic", "claude"],
+        default="heuristic",
+        help="heuristic: deterministic, offline, free (default). claude: sends each "
+        "bundle to the Claude API -- costs money and needs credentials.",
+    )
+    confirm_parser.add_argument("--model", default="claude-opus-5", help="Model for --judge claude")
+    confirm_parser.add_argument("--limit", type=int, default=50, help="Max findings to judge")
+    confirm_parser.add_argument(
+        "--write-feedback",
+        metavar="FEEDBACK_DB",
+        help="Record each verdict in this feedback DB for score tuning",
+    )
+    confirm_parser.add_argument("--out", help="Write report to file instead of stdout")
+
     web_parser = sub.add_parser("web-ui", help="Render a standalone interactive web UI HTML report")
     web_parser.add_argument("--out", help="Write report to file instead of stdout")
 
@@ -266,7 +286,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         parser.parse_all()
         return parser.get_graph()
 
-    if args.command in {"scan", "bounty-report", "ci-scan", "submit-report", "poc", "web-ui", "explain"}:
+    if args.command in {"scan", "bounty-report", "ci-scan", "submit-report", "poc", "web-ui", "explain", "confirm"}:
         cve_enricher = CVEEnricher.from_feed(args.cve_feed) if getattr(args, "cve_feed", None) else None
         external_graphs = []
         if getattr(args, "dependencies", None):
@@ -306,6 +326,23 @@ def _main(argv: Optional[List[str]] = None) -> int:
             output = json.dumps(
                 build_evidence_report(bounty.findings, limit=args.limit), indent=2
             )
+        elif args.command == "confirm":
+            from analyzers.confirm import ClaudeJudge, HeuristicJudge, run_confirmation
+            from analyzers.evidence import build_evidence_bundle
+
+            bundles = [
+                build_evidence_bundle(finding).to_dict()
+                for finding in bounty.findings[: args.limit]
+            ]
+            judge = ClaudeJudge(model=args.model) if args.judge == "claude" else HeuristicJudge()
+            writer = None
+            if args.write_feedback:
+                def writer(fingerprint, verdict, notes, _db=args.write_feedback):
+                    record_feedback(
+                        _db, FeedbackEntry(fingerprint=fingerprint, verdict=verdict, notes=notes)
+                    )
+            report = run_confirmation(bundles, judge, feedback_writer=writer)
+            output = json.dumps(report.to_dict(), indent=2)
         elif args.command == "poc":
             output = json.dumps([generate_poc_hints(finding, collaborator_base=args.collaborator) for finding in bounty.findings[:10]], indent=2)
         elif args.command == "web-ui":
