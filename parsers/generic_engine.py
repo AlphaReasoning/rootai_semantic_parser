@@ -1163,14 +1163,20 @@ class GenericTreeSitterParser(TreeSitterParser):
         if position >= len(operands):
             return
 
+        from analyzers.boundaries import WHOLE_VALUE_CONSUMERS
+
         template = self._build_template(operands[position], src, fn_id)
         if not template.segments:
             return
         # A template that is nothing but one hole carries no syntax, so any
-        # position the grammar reports for it is an artifact of the probe token
-        # rather than a fact about the code. `execute(buildQuery(req))` would
-        # otherwise be claimed as an identifier position with full confidence.
-        if all(kind == "hole" for kind, _ in template.segments):
+        # position a *grammar* reports for it is an artifact of the probe token:
+        # `execute(buildQuery(req))` would otherwise be claimed as an identifier
+        # position with full confidence. But for format/template/regex a bare
+        # value is exactly the vulnerability -- `printf(userInput)` is the bug
+        # -- so those consumers keep it.
+        if consumer not in WHOLE_VALUE_CONSUMERS and all(
+            kind == "hole" for kind, _ in template.segments
+        ):
             return
         analysis = analyse(template.render(), consumer)
         if analysis is None:

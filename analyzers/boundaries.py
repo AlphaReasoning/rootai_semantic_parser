@@ -123,6 +123,7 @@ URL_SCHEME_CHECK = "url-scheme-check"
 CSS_ESCAPE = "css-escape"
 XPATH_ESCAPE = "xpath-escape"
 LDAP_ESCAPE = "ldap-escape"
+REGEX_ESCAPE = "regex-escape"
 REJECT = "reject"
 
 #: Sanitiser names mapped to the capability they provide. A defence absent here
@@ -172,6 +173,13 @@ DEFENCE_CAPABILITIES: Dict[str, FrozenSet[str]] = {
     "encodefordn": frozenset({LDAP_ESCAPE}),
     "ldap_escape": frozenset({LDAP_ESCAPE}),
     "escapeldapsearchfilter": frozenset({LDAP_ESCAPE}),
+    # Regex-literal escaping: a value escaped this way matches literally and
+    # cannot alter the pattern's structure.
+    "re.escape": frozenset({REGEX_ESCAPE}),
+    "regexp.escape": frozenset({REGEX_ESCAPE}),
+    "pattern.quote": frozenset({REGEX_ESCAPE}),
+    "escaperegexp": frozenset({REGEX_ESCAPE}),
+    "quotemeta": frozenset({REGEX_ESCAPE}),
 }
 
 
@@ -426,6 +434,73 @@ def _classify_ldap(text: str, offset: int) -> Position:
     return LDAP_STRUCTURE
 
 
+# ---------------------------------------------------------------------------
+# Regex, format strings, template bodies -- consumers where the interesting
+# question is not "which slot" but "should attacker input reach this at all".
+# ---------------------------------------------------------------------------
+
+REGEX_PATTERN = Position(
+    "regex:pattern",
+    frozenset({REGEX_ESCAPE, NUMERIC_CAST}),
+    "interpolated into a regex; unescaped metacharacters change what it matches (regex injection)",
+)
+REGEX_QUANTIFIER = Position(
+    "regex:quantifier",
+    frozenset({NUMERIC_CAST, REJECT}),
+    "a repetition count in a regex; a crafted value triggers catastrophic backtracking (ReDoS) that escaping cannot prevent",
+    structural=True,
+)
+
+FORMAT_STRING = Position(
+    "format:format-string",
+    frozenset({REJECT, NUMERIC_CAST}),
+    "the format string itself; %n and %x let the value read or write memory. Use a constant format string and pass the value as an argument",
+    structural=True,
+)
+
+TEMPLATE_BODY = Position(
+    "template:template-body",
+    frozenset({REJECT}),
+    "the template source; template syntax in the value is evaluated (server-side template injection -> RCE). Pass the value as a context variable, never into the template text",
+    structural=True,
+)
+
+
+def _classify_regex(text: str, offset: int) -> Position:
+    """Position of a hole in a regex pattern.
+
+    A value inside a `{...}` quantifier controls repetition and is a ReDoS
+    vector no escaping fixes; anywhere else the value is pattern text, made
+    literal by regex escaping.
+    """
+    depth_brace = 0
+    for char in text[:offset]:
+        if char == "{":
+            depth_brace += 1
+        elif char == "}":
+            depth_brace = max(0, depth_brace - 1)
+    if depth_brace > 0:
+        return REGEX_QUANTIFIER
+    return REGEX_PATTERN
+
+
+def _classify_format(text: str, offset: int) -> Position:
+    """Any value reaching the format-string argument is the vulnerability.
+
+    There is no safe position *within* a format string for attacker input; the
+    format string must be a constant. The scan is unused -- the position is the
+    same wherever the hole falls -- but the signature matches the others.
+    """
+    del text, offset
+    return FORMAT_STRING
+
+
+def _classify_template(text: str, offset: int) -> Position:
+    """Any value reaching the template body is server-side template injection."""
+    del text, offset
+    return TEMPLATE_BODY
+
+
 @dataclass(frozen=True)
 class Consumer:
     name: str
@@ -446,7 +521,19 @@ CONSUMERS: Dict[str, Consumer] = {
     "html": Consumer("html", "html", HTML_RULES),
     "xpath": Consumer("xpath", "", classify=_classify_xpath),
     "ldap": Consumer("ldap", "", classify=_classify_ldap),
+    "regex": Consumer("regex", "", classify=_classify_regex),
+    "format": Consumer("format", "", classify=_classify_format),
+    "template": Consumer("template", "", classify=_classify_template),
 }
+
+#: Consumers where a bare tainted value -- a single hole with no surrounding
+#: syntax -- is itself the finding, rather than an unanalysable expression.
+#: `printf(userInput)`, `render_template_string(userInput)` and
+#: `re.compile(userInput)` are the vulnerability precisely because the value is
+#: the whole thing. For grammar consumers a lone hole carries no context and is
+#: skipped, but here there is nothing to skip -- the value *is* the format
+#: string / template / pattern.
+WHOLE_VALUE_CONSUMERS = frozenset({"format", "template", "regex"})
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +584,26 @@ SINK_CONSUMERS: Dict[str, Tuple[str, int]] = {
     "dircontext.search": ("ldap", 1), "initialdircontext.search": ("ldap", 1),
     "ldapcontext.search": ("ldap", 1), "idc.search": ("ldap", 1), "ctx.search": ("ldap", 1),
     "ldap_search": ("ldap", 2), "ldap_list": ("ldap", 2),
+    # Regex -- the pattern is the first argument to compile/match/search/sub.
+    "re.compile": ("regex", 0), "re.match": ("regex", 0), "re.search": ("regex", 0),
+    "re.findall": ("regex", 0), "re.finditer": ("regex", 0), "re.fullmatch": ("regex", 0),
+    "re.sub": ("regex", 0), "re.split": ("regex", 0),
+    "pattern.compile": ("regex", 0),
+    # Format strings -- the format argument's index varies by function. A
+    # tainted value there is a format-string vulnerability; tainted *arguments*
+    # after it are not, which is why the index matters.
+    "printf": ("format", 0), "vprintf": ("format", 0),
+    "fprintf": ("format", 1), "vfprintf": ("format", 1),
+    "sprintf": ("format", 1), "vsprintf": ("format", 1),
+    "snprintf": ("format", 2), "vsnprintf": ("format", 2),
+    "syslog": ("format", 1),
+    # Java/Python string formatting is deliberately absent: neither exposes the
+    # %n write primitive that makes C format strings a memory-corruption sink,
+    # so a tainted format there is not the same vulnerability class.
+    # Server-side templates -- the template body is the first argument.
+    "render_template_string": ("template", 0), "handlebars.compile": ("template", 0),
+    "ejs.render": ("template", 0), "pug.compile": ("template", 0),
+    "jinja2.template": ("template", 0), "twig.render": ("template", 0),
 }
 
 #: Sinks whose argument is not parsed as another language at all. Recorded so

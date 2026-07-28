@@ -229,6 +229,41 @@ def test_ldap_encoder_does_not_defend_the_filter_structure() -> None:
     assert verdict.hole is not None and verdict.hole.position.structural
 
 
+# ---------------------------------------------------------------------------
+# Regex, format strings, SSTI: consumers where the value should not be here
+# ---------------------------------------------------------------------------
+
+
+def test_a_value_in_a_regex_pattern_needs_escaping() -> None:
+    assert _verdict(f"^{H}$", "regex", []).outcome == UNDEFENDED
+    assert _verdict(f"^{H}$", "regex", ["re.escape"]).outcome == SAFE
+
+
+def test_a_value_in_a_regex_quantifier_is_a_redos_vector() -> None:
+    """A repetition count is structural: escaping the value cannot stop the
+    backtracking a large count triggers."""
+    verdict = _verdict(f"a{{{H}}}", "regex", ["re.escape"])
+    assert verdict.hole is not None and verdict.hole.position.name == "regex:quantifier"
+    assert verdict.hole.position.structural
+    assert verdict.outcome == MISMATCH
+
+
+def test_a_bare_value_as_a_format_string_is_flagged() -> None:
+    """`printf(userInput)` -- the value IS the format string, so a lone hole is
+    the finding, not an unanalysable expression."""
+    verdict = _verdict(H, "format", [])
+    assert verdict.outcome == UNDEFENDED
+    assert verdict.hole is not None and verdict.hole.position.name == "format:format-string"
+    assert verdict.hole.position.structural
+
+
+def test_a_bare_value_as_a_template_is_ssti() -> None:
+    verdict = _verdict(H, "template", [])
+    assert verdict.outcome == UNDEFENDED
+    assert verdict.hole is not None and verdict.hole.position.name == "template:template-body"
+    assert verdict.hole.position.structural
+
+
 def test_an_unknown_consumer_yields_no_analysis() -> None:
     """Callers fall back to ordinary taint reasoning; nothing is suppressed."""
     assert analyse(f"foo {H}", "brainfuck") is None

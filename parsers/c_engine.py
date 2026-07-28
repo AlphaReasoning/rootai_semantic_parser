@@ -1236,6 +1236,74 @@ class CParser(TreeSitterParser):
                 )
 
         self._link_call_arguments(node, src, path, parent_id, callee_id, callee)
+        self._note_c_boundary(node, src, callee_id, callee)
+
+    def _note_c_boundary(self, node, src: str, callee_id: str, callee: str) -> None:
+        """Record the format-string boundary at a C format-family sink.
+
+        C format strings are the memory-corruption injection class -- `%n` reads
+        and writes through the argument list -- and they are almost entirely a C
+        concern, so this is their natural home. The other engines cover their
+        own languages' boundaries; the C engine covers this one. The question is
+        narrow: is the format argument a constant string literal, or a value?
+        A value there is the vulnerability.
+        """
+        from analyzers.boundaries import analyse, consumer_for
+
+        mapping = consumer_for(callee)
+        if mapping is None:
+            return
+        consumer, position = mapping
+        operands = self._call_argument_nodes(node, src)
+        if position >= len(operands):
+            return
+        template = self._build_c_format_template(operands[position][1], src)
+        if not template.segments:
+            return
+        analysis = analyse(template.render(), consumer)
+        if analysis is None:
+            return
+        self.nodes[callee_id].metadata["boundary"] = {
+            **analysis.to_dict(),
+            **template.to_dict(),
+            "trustworthy_safe": template.complete,
+        }
+
+    def _build_c_format_template(self, node, src: str):
+        """Reconstruct a C format argument as literals plus holes.
+
+        C has no string ``+``; a format string is a literal, a run of adjacent
+        literals (`"a" "b"`), or a single value. That makes reconstruction
+        simple and the dangerous case unmistakable: a bare identifier where a
+        constant was expected.
+        """
+        from analyzers.boundaries import StringTemplate
+
+        template = StringTemplate()
+        self._extend_c_format_template(template, node, src)
+        return template
+
+    def _extend_c_format_template(self, template, node, src: str, depth: int = 0) -> None:
+        if node is None or depth > 8:
+            template.complete = False
+            return
+        if node.type == _TS_STRING_LITERAL:
+            text = self._get_text(src, node).strip()
+            body = text[1:-1] if len(text) >= 2 and text[0] == '"' else text
+            template.add_literal(body)
+            return
+        if node.type in (_TS_NUMBER_LITERAL, _TS_CHAR_LITERAL):
+            template.add_literal(self._get_text(src, node).strip())
+            return
+        if node.type == "concatenated_string":
+            for child in node.children:
+                if child.is_named:
+                    self._extend_c_format_template(template, child, src, depth + 1)
+            return
+        # An identifier, a member expression, a cast -- a runtime value where a
+        # constant format string belongs.
+        template.complete = False
+        template.add_hole(self._get_text(src, node).strip()[:80])
 
     # ------------------------------------------------------------------
     # Call-argument value modelling

@@ -316,6 +316,16 @@ class PythonParser(LanguageParser):
             is_source = any(s in rhs_str for s in taint_sources) or any(
                 any(s in ref.lower() for s in taint_sources) for ref in value_refs
             )
+            # `term = re.escape(request.args.get(...))` reads from a source, but
+            # the value is *sanitised on the way in*. Seeding the target as an
+            # independent source anyway created a second path that starts at the
+            # target and bypasses the sanitiser entirely -- and because that path
+            # ties on score with the real one, which won was decided by node-id
+            # hashes and so varied run to run. Taint still reaches the target
+            # through the call-return edge (correctly marked sanitised); it just
+            # must not also be seeded here.
+            if is_source and self._outermost_is_sanitizer(value_node):
+                is_source = False
             assign_line = getattr(assign_node, "lineno", 0)
             enclosing = self._enclosing(assign_line, fn_ranges, module_id)
             if isinstance(assign_node, ast.Assign):
@@ -395,14 +405,21 @@ class PythonParser(LanguageParser):
                     self.edges.append(self._edge(rhs_id, tid, EdgeRelation.DATAFLOW, {"flow_kind": "assignment_rhs"}))
                     if self.nodes.get(rhs_id) and self.nodes[rhs_id].is_unsafe:
                         self.nodes[tid].is_unsafe = True
-            for sub_node in ast.walk(value_node):
-                if isinstance(sub_node, ast.Call):
-                    callee_name = self._call_name(sub_node)
-                    if callee_name:
-                        callee_id = self._make_id(path, callee_name)
-                        self._ensure_call_target(path, callee_name, getattr(sub_node, "lineno", assign_line))
-                        for tid in new_target_ids:
-                            self.edges.append(self._edge(callee_id, tid, EdgeRelation.DATAFLOW, {"flow_kind": "call_return"}))
+            # Only the *outermost* calls return into the target. `term =
+            # re.escape(request.args.get(x))` returns re.escape's result; the
+            # inner request.args.get returns into re.escape, not into term.
+            # Walking every call wired request.args.get -> term directly, a path
+            # that bypasses the sanitiser -- and because it tied on score with
+            # the real path, node-id hashes decided which won, making the verdict
+            # flip between runs. `_top_level_calls` keeps only the calls not
+            # nested inside another call in the value.
+            for sub_node in self._top_level_calls(value_node):
+                callee_name = self._call_name(sub_node)
+                if callee_name:
+                    callee_id = self._make_id(path, callee_name)
+                    self._ensure_call_target(path, callee_name, getattr(sub_node, "lineno", assign_line))
+                    for tid in new_target_ids:
+                        self.edges.append(self._edge(callee_id, tid, EdgeRelation.DATAFLOW, {"flow_kind": "call_return"}))
 
         for call_node in deferred_calls:
             callee_name = self._call_name(call_node)
@@ -438,7 +455,7 @@ class PythonParser(LanguageParser):
         consumer's grammar where each value lands, and attach the verdict inputs
         to the sink node for the taint layer to judge.
         """
-        from analyzers.boundaries import analyse, consumer_for
+        from analyzers.boundaries import WHOLE_VALUE_CONSUMERS, analyse, consumer_for
 
         mapping = consumer_for(callee_name)
         if mapping is None:
@@ -447,7 +464,13 @@ class PythonParser(LanguageParser):
         if position >= len(call_node.args):
             return
         template = self._build_ast_template(call_node.args[position])
-        if not template.segments or all(kind == "hole" for kind, _ in template.segments):
+        if not template.segments:
+            return
+        # For format/template/regex a bare value is the vulnerability; for the
+        # grammar consumers a lone hole carries no syntax and is skipped.
+        if _consumer not in WHOLE_VALUE_CONSUMERS and all(
+            kind == "hole" for kind, _ in template.segments
+        ):
             return
         analysis = analyse(template.render(), _consumer)
         if analysis is None:
@@ -460,6 +483,52 @@ class PythonParser(LanguageParser):
             **template.to_dict(),
             "trustworthy_safe": template.complete,
         }
+
+    @staticmethod
+    def _top_level_calls(node: ast.AST) -> List[ast.Call]:
+        """Calls in ``node`` not nested inside another call.
+
+        `re.escape(get(x))` has one top-level call, `re.escape`. The inner
+        `get` is that call's argument, so its result flows into `re.escape`,
+        not into whatever `node` is assigned to.
+        """
+        result: List[ast.Call] = []
+
+        def walk(current: ast.AST) -> None:
+            for child in ast.iter_child_nodes(current):
+                if isinstance(child, ast.Call):
+                    result.append(child)
+                    # Descend into the callee (`a.b` in `a.b()`) but not the
+                    # arguments -- those belong to this call.
+                    walk(child.func)
+                else:
+                    walk(child)
+
+        if isinstance(node, ast.Call):
+            result.append(node)
+            walk(node.func)
+        else:
+            walk(node)
+        return result
+
+    def _outermost_is_sanitizer(self, node: ast.AST) -> bool:
+        """Whether the value's outermost operation is a known sanitiser call.
+
+        `re.escape(x)`, `shlex.quote(x)`, `int(x)` -- the result is defended,
+        so the target it is assigned to is not itself an unsanitised source.
+        Only the *outermost* call counts: a sanitiser nested inside a larger
+        expression does not defend the whole value.
+        """
+        if not isinstance(node, ast.Call):
+            return False
+        name = self._call_name(node)
+        if not name:
+            return False
+        lowered = name.lower()
+        return any(
+            candidate == lowered or lowered.endswith("." + candidate) or lowered.endswith(candidate)
+            for candidate in (s.lower() for s in self.config.to_taint_config().sanitizers)
+        )
 
     def _build_ast_template(self, node: ast.AST, depth: int = 0):
         """Reconstruct the string an ast expression builds, as literals + holes.

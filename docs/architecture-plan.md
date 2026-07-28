@@ -172,21 +172,41 @@ wild samples, and no case claims a CVE number it cannot substantiate.
 fixed so downstream tooling can depend on it.
 *Check*: bundle contains template, positions, defences, path, route, question.
 
-### Step 7 — More consumers (in progress)
-**XPath and LDAP done.** Neither has a tree-sitter grammar, so each is a
-hand-written character-scan classifier in the same `Consumer` framework (a
-`classify` callable instead of grammar `rules`). Same principle as SQL: a value
-in a string literal / filter value needs escaping; a value in a structural slot
-(node name, filter attribute, operator) cannot be escaped and needs an
-allowlist. Both ship with positive and negative controls in unit tests and the
-corpus, and both directions of the wrong-defence case (encoder on a structural
-position → MISMATCH). Sink→consumer map covers `xp.evaluate`/`XPath.compile`/
-`selectNodes` and Java `DirContext.search` (filter at arg 1) / PHP `ldap_search`
-(arg 2).
-*Still to do*: regex (ReDoS / pattern injection), template engines, format
-strings, YAML/pickle deserialization.
-*Check*: 386 tests; boundary corpus 30 in-scope cases at 100%/100%; OWASP
-xpathi/ldapi categories hold; overall floor unchanged.
+### Step 7 — More consumers ✅
+**XPath, LDAP, regex, format strings and SSTI done.** None has a tree-sitter
+grammar, so each is a hand-written classifier in the same `Consumer` framework
+(a `classify` callable instead of grammar `rules`).
+
+- **XPath / LDAP** — same principle as SQL: a value in a string literal / filter
+  value needs escaping; a value in a structural slot (node name, filter
+  attribute, operator) cannot be escaped and needs an allowlist. Both directions
+  of the wrong-defence case tested (encoder on a structural position → MISMATCH).
+- **regex** — a value in the pattern needs regex-escaping (`re.escape`,
+  `Pattern.quote`); a value in a `{…}` quantifier is a ReDoS vector escaping
+  can't fix (structural).
+- **format strings** — the format argument must be a constant; any value there
+  is a `%n`-class memory sink. Wired into the dedicated C engine (its natural
+  home) as well as the generic/ast engines. Deliberately *not* mapped for
+  Java/Python, which lack the `%n` write primitive.
+- **SSTI** — any value reaching a template body (`render_template_string`, etc.)
+  is server-side template injection.
+
+For format/template/regex a bare tainted value *is* the finding, so those
+consumers keep a single-hole template that the grammar consumers discard.
+
+**A real bug this surfaced:** the regex-escaped negative control was
+non-deterministically SAFE/UNKNOWN — the Python ast engine wired *every* nested
+call's return into a binding, so `term = re.escape(get(x))` had a
+`get → term` edge bypassing the sanitiser, and node-id hashes decided which
+tied path won. Fixed with `_top_level_calls` (only outermost calls return into
+the binding), the same fix already made in the tree-sitter engine. This closed
+a genuine sanitiser-bypass, not just flakiness.
+
+*Deferred*: YAML/pickle deserialization — honestly not a grammatical-position
+problem (the whole payload is the exploit regardless of structure), so it stays
+in `UNMAPPED_SINKS` with the reason rather than getting a token consumer.
+*Check*: 390 tests (stable across repeated runs); boundary corpus 35 in-scope
+cases at 100%/100%; OWASP floor and real-target corpus unchanged.
 
 ### Step 8 — Confirmation loop (L5)
 `confirm` subcommand driving an LLM over evidence bundles, writing outcomes to

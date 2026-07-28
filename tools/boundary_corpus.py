@@ -533,6 +533,89 @@ CASES: List[Case] = [
         provenance="synthetic: correctly-escaped LDAP filter (negative control)",
     ),
     # -----------------------------------------------------------------------
+    # Regex, format strings, SSTI -- "the value should not be here" consumers
+    # -----------------------------------------------------------------------
+    _c(
+        id="regex_pattern_undefended_py",
+        filename="regex_undefended.py",
+        source=(
+            "import re\n"
+            "def view(request):\n"
+            "    term = request.args.get('q')\n"
+            "    return re.compile('^' + term + '$')\n"
+        ),
+        consumer="regex",
+        expect_position="regex:pattern",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="user input in a regex with no escaping; metacharacters alter the match / ReDoS",
+        provenance="synthetic: regex injection",
+    ),
+    _c(
+        id="regex_pattern_escaped_py",
+        filename="regex_escaped.py",
+        source=(
+            "import re\n"
+            "def view(request):\n"
+            "    term = re.escape(request.args.get('q'))\n"
+            "    return re.compile('^' + term + '$')\n"
+        ),
+        consumer="regex",
+        expect_position="regex:pattern",
+        expect_verdict=SAFE,
+        is_vulnerable=False,
+        rationale="re.escape makes the value match literally; correct for a pattern position",
+        provenance="synthetic: escaped regex (negative control)",
+    ),
+    _c(
+        id="format_string_tainted_c",
+        filename="format_tainted.c",
+        source=(
+            "#include <stdio.h>\n#include <stdlib.h>\n"
+            "void v(void) {\n"
+            "    char* u = getenv(\"U\");\n"
+            "    printf(u);\n}\n"
+        ),
+        consumer="format",
+        expect_position="format:format-string",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="attacker-controlled format string; %n reads and writes memory",
+        provenance="synthetic: C format-string vulnerability",
+    ),
+    _c(
+        id="format_string_constant_c",
+        filename="format_constant.c",
+        source=(
+            "#include <stdio.h>\n#include <stdlib.h>\n"
+            "void v(void) {\n"
+            "    char* u = getenv(\"U\");\n"
+            "    printf(\"%s\", u);\n}\n"
+        ),
+        consumer="format",
+        expect_position=None,
+        expect_verdict=SAFE,
+        is_vulnerable=False,
+        rationale="the format string is a constant; the value is a plain argument",
+        provenance="synthetic: constant format string (negative control)",
+    ),
+    _c(
+        id="ssti_render_template_string_py",
+        filename="ssti.py",
+        source=(
+            "from flask import render_template_string\n"
+            "def view(request):\n"
+            "    name = request.args.get('name')\n"
+            "    return render_template_string('<h1>Hello ' + name + '</h1>')\n"
+        ),
+        consumer="template",
+        expect_position="template:template-body",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="user input concatenated into the template body; Jinja syntax executes (SSTI -> RCE)",
+        provenance="synthetic: server-side template injection",
+    ),
+    # -----------------------------------------------------------------------
     # Python host language, via the ast engine's own reconstruction
     # -----------------------------------------------------------------------
     _c(
