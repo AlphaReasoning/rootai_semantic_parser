@@ -136,12 +136,32 @@ alone but to hand the dynamic/confirmation leg a finding that already carries
 its own test recipe, so the two tools compose instead of re-deriving each
 other's work. The evidence bundle is that interface.
 
-### Step 5 — Corpus for what this actually does
+### Step 5 — Corpus for what this actually does ✅
 Benchmark cannot measure boundary reasoning; it has no `ORDER BY` injection, no
-script-context XSS, no wrong-escaper cases. Build a labelled corpus of
-context-mismatch cases, hand-written and drawn from real CVEs.
-*Check*: first honest recall/precision numbers for the capability that
-differentiates the tool.
+script-context XSS, no wrong-escaper cases. `tools/boundary_corpus.py` is a
+labelled corpus authored for exactly this — every case's ground truth is known
+by construction (consumer, position, defence adequacy, real vulnerability), and
+the labels live beside the source so a reviewer can check each one.
+
+`tools/score_boundary_corpus.py` measures three things that fail independently:
+position accuracy, verdict accuracy, and detector recall/precision, plus the
+headline sub-metric — wrong-defence (MISMATCH) detection, the class Benchmark
+contains none of. `tests/benchmarks/test_boundary_corpus.py` pins the numbers
+as a living regression.
+
+Current, over 22 in-scope cases: **position 100%, verdict 100%, detector recall
+100% precision 100%, MISMATCH 4/4.** Honest caveats: it is a small, synthetic,
+self-authored corpus, so a clean sweep means "handles the classes it targets",
+not "perfect". Its value is that it *found* real gaps while being built —
+nested-call sanitiser bypass (`parseInt(getParam(x))` skipped the cast; fixed),
+unknown-wrapper-at-structural-position wrongly UNKNOWN (fixed), and
+guard/boundary join for allowlist guards (fixed). Two documented gaps remain,
+scored apart from the headline: StringBuilder `.append()` chains and Python
+f-strings (the ast engine has no reconstruction).
+
+Provenance is explicit: these are synthetic reproductions of real bug *classes*
+(ORDER BY injection, wrong-context encoding, command-name substitution), not
+wild samples, and no case claims a CVE number it cannot substantiate.
 
 ### Step 6 — Evidence bundle output
 `semantic-parser explain <finding>` emitting the LLM-ready bundle; JSON schema

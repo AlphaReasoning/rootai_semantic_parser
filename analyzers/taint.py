@@ -642,7 +642,18 @@ class TaintAnalyzer:
             for node in nodes[1:-1]
             if node.get("type") == "Function" or self._is_sanitizer(node)
         ]
-        verdict = boundaries.judge(analysis, applied)
+        # A constraining validation guard -- `if (!ALLOWED.includes(x)) return;`
+        # -- is the only thing that defends a structural position, but it is
+        # control flow, not a call, so it is invisible to the label scan above.
+        # The guard modeller already recorded it on the value node as an
+        # all-category sanitiser; surface that to the boundary judge as an
+        # allowlist capability, or a guarded ORDER BY reads as undefended.
+        extra: Set[str] = set()
+        for node in nodes:
+            metadata = node.get("metadata") or {}
+            if metadata.get("guarded") and "*" in (metadata.get("sanitizer_for") or []):
+                extra.add(boundaries.ALLOWLIST)
+        verdict = boundaries.judge(analysis, applied, frozenset(extra))
         trustworthy_safe = bool(boundary_meta.get("trustworthy_safe", True))
 
         adjustment = 0.0

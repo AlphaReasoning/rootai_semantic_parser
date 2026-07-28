@@ -594,15 +594,27 @@ def capabilities_of(sanitizers: Sequence[str]) -> Tuple[FrozenSet[str], Tuple[st
     return frozenset(known), tuple(unknown)
 
 
-def judge(analysis: BoundaryAnalysis, sanitizers: Sequence[str]) -> Verdict:
+def judge(
+    analysis: BoundaryAnalysis,
+    sanitizers: Sequence[str],
+    extra_capabilities: FrozenSet[str] = frozenset(),
+) -> Verdict:
     """Compare the defences applied against the ones the position requires.
 
     The interesting outcome is ``MISMATCH``: a defence *was* applied and it is
     the wrong kind for where the value lands. `html.escape` on a value that
     ends up inside a `<script>` block is the canonical case, and both a taint
     engine and a reviewer skimming the diff will call it defended.
+
+    ``extra_capabilities`` are defences established by something other than a
+    named call on the path -- most importantly a validation guard. An allowlist
+    check (`if (!ALLOWED.includes(sort)) return;`) is the *only* thing that
+    defends a structural position, but it is a control-flow construct, not a
+    sanitiser call, so without this it would be invisible here and a guarded
+    ORDER BY would be reported as undefended.
     """
     applied, unknown = capabilities_of(sanitizers)
+    applied = applied | extra_capabilities
     if analysis.no_holes:
         return Verdict(SAFE, None, tuple(sorted(applied)),
                        "no runtime value reaches the consumed language as syntax")
@@ -624,6 +636,19 @@ def judge(analysis: BoundaryAnalysis, sanitizers: Sequence[str]) -> Verdict:
             f"applied {sorted(applied)} but {worst.position.name} requires one of "
             f"{sorted(worst.position.accepts)} -- {worst.position.rationale}",
         )
+    if worst.position.structural:
+        # No escaping defends a structural position -- only an allowlist, a
+        # numeric cast, or rejection. An unrecognised wrapper is not evidence of
+        # any of those, so it does not earn the benefit of the doubt an escaper
+        # would at a quotable position: the honest verdict is that no applicable
+        # defence was found, not that the wrapper's effect is unknown.
+        detail = f"{worst.position.name}: {worst.position.rationale}"
+        if unknown:
+            detail += (
+                f" -- an unrecognised wrapper ({', '.join(unknown)}) is present, but no "
+                f"escaper can defend this position"
+            )
+        return Verdict(UNDEFENDED, worst, tuple(unknown), detail)
     if unknown:
         return Verdict(UNKNOWN, worst, tuple(unknown),
                        f"{', '.join(unknown)} is not a recognised defence, so its effect here is unknown")

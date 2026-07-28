@@ -839,11 +839,20 @@ class GenericTreeSitterParser(TreeSitterParser):
             for referenced in self._referenced_values(value_nodes, src, fn_id)
             if referenced not in call_argument_values
         ]
+        # Only the *outermost* calls return into the binding. In
+        # `col = parseInt(getParameter(x))` the value of the binding is what
+        # parseInt returns; getParameter returns into parseInt, not into col.
+        # Wiring every nested call into the binding let taint flow
+        # getParameter -> col directly, skipping the sanitiser in between --
+        # which is exactly how a numeric cast or an escaper wrapping the source
+        # was silently bypassed. Nested calls are wired into their enclosing
+        # call by `_visit_call` itself.
+        #
         # Visited once here rather than per target, which also stops a
         # multi-target binding from emitting the same call twice.
         call_returns = [
             callee_id
-            for call in self._iter_calls(value_nodes)
+            for call in self._top_level_calls(value_nodes)
             if (callee_id := self._visit_call(call, src, path, fn_id))
         ]
 
@@ -964,6 +973,22 @@ class GenericTreeSitterParser(TreeSitterParser):
                         },
                     )
                 )
+            # A call nested in these arguments returns its value *into this
+            # call*: `parseInt(getParameter(x))` feeds getParameter's result to
+            # parseInt. Without this the inner call reached only the binding,
+            # routing taint around the outer sanitiser.
+            for nested in self._immediate_argument_calls(arguments):
+                nested_id = self._visit_call(nested, src, path, fn_id)
+                if nested_id and nested_id != callee_id:
+                    self.edges.append(
+                        self._edge(
+                            nested_id,
+                            callee_id,
+                            EdgeRelation.DATAFLOW,
+                            {"flow_kind": "call_argument", "call_name": callee_text},
+                        )
+                    )
+                    argument_ids.append(nested_id)
             self._note_collection_write(callee_text, argument_ids, src, fn_id)
             if is_sink:
                 self._note_boundary(callee_id, callee_text, arguments, src, fn_id)
@@ -1759,6 +1784,46 @@ class GenericTreeSitterParser(TreeSitterParser):
             for candidate in self._iter_all(root, include_self=True):
                 if candidate.type in self.profile.call_nodes:
                     yield candidate
+
+    def _top_level_calls(self, nodes: List[Any]) -> List[Any]:
+        """Calls in ``nodes`` that are not nested inside another call there.
+
+        `parseInt(getParameter(x))` has one top-level call, `parseInt`. The
+        inner one is that call's business, not the binding's.
+        """
+        result: List[Any] = []
+
+        def walk(node) -> None:
+            if node.type in self.profile.call_nodes:
+                result.append(node)
+                return  # its own nested calls belong to it, not the binding
+            for child in node.children:
+                walk(child)
+
+        for root in nodes:
+            walk(root)
+        return result
+
+    def _immediate_argument_calls(self, arguments) -> List[Any]:
+        """Calls directly inside ``arguments``, not nested within another call.
+
+        These are the values passed to the enclosing call: in `outer(inner(x),
+        y())`, both `inner(x)` and `y()`. Their results flow into `outer`, so a
+        sanitiser wrapping a source (`escape(getParam(x))`) is on the path
+        rather than bypassed.
+        """
+        result: List[Any] = []
+
+        def walk(node) -> None:
+            if node.type in self.profile.call_nodes:
+                result.append(node)
+                return
+            for child in node.children:
+                walk(child)
+
+        for child in arguments.children:
+            walk(child)
+        return result
 
     @staticmethod
     def _iter_all(node, include_self: bool = False):
