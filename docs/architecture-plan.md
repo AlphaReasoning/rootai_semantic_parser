@@ -149,15 +149,19 @@ headline sub-metric — wrong-defence (MISMATCH) detection, the class Benchmark
 contains none of. `tests/benchmarks/test_boundary_corpus.py` pins the numbers
 as a living regression.
 
-Current, over 22 in-scope cases: **position 100%, verdict 100%, detector recall
+Current, over 26 in-scope cases: **position 100%, verdict 100%, detector recall
 100% precision 100%, MISMATCH 4/4.** Honest caveats: it is a small, synthetic,
 self-authored corpus, so a clean sweep means "handles the classes it targets",
 not "perfect". Its value is that it *found* real gaps while being built —
 nested-call sanitiser bypass (`parseInt(getParam(x))` skipped the cast; fixed),
 unknown-wrapper-at-structural-position wrongly UNKNOWN (fixed), and
-guard/boundary join for allowlist guards (fixed). Two documented gaps remain,
-scored apart from the headline: StringBuilder `.append()` chains and Python
-f-strings (the ast engine has no reconstruction).
+guard/boundary join for allowlist guards (fixed). The two gaps it originally
+recorded are now both closed: **StringBuilder** `.append()` assembly (statement-
+separated and seeded-constructor forms reconstruct; fluent chains reconstruct
+but their taint flow is a separate, narrower limitation) and **Python** — the
+ast engine now reconstructs f-strings, `+` concatenation, `%` and `.format`
+templating, so the primary pre-ship language has boundary analysis like the
+rest. No known-gap cases remain in the corpus.
 
 Provenance is explicit: these are synthetic reproductions of real bug *classes*
 (ORDER BY injection, wrong-context encoding, command-name substitution), not

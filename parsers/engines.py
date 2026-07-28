@@ -173,6 +173,10 @@ class PythonParser(LanguageParser):
         super().__init__(config, options=options)
         self.ssa = SSAVersionTracker()
         self._import_aliases: Dict[str, Dict[str, Any]] = {}
+        #: name -> the string template it was built from, so a sink handed a
+        #: variable can still be told what the consuming parser will see. The
+        #: tree-sitter engine has the same map; this is its ast equivalent.
+        self._templates: Dict[str, Any] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -189,6 +193,7 @@ class PythonParser(LanguageParser):
         module_id = self._make_id(path, "__module__")
         self.nodes[module_id] = self._make_node(module_id, NodeType.MODULE, os.path.basename(path), path)
         self._import_aliases = {}
+        self._templates = {}
         fn_ranges: List[Tuple[int, int, str]] = []
         class_map: Dict[str, str] = {}
         deferred_calls: List[ast.Call] = []
@@ -317,6 +322,20 @@ class PythonParser(LanguageParser):
                 targets = assign_node.targets
             else:
                 targets = [assign_node.target]
+            # Record the string template for a simple `name = <expr>` binding, so
+            # a sink handed `name` later can be shown the query it builds. Only
+            # plain single-name targets: subscripts and attributes need scope
+            # handling the boundary layer does not yet use.
+            if (
+                not isinstance(assign_node, (ast.For, ast.AsyncFor))
+                and len(targets) == 1
+                and isinstance(targets[0], ast.Name)
+            ):
+                built = self._build_ast_template(value_node)
+                if any(kind == "lit" for kind, _ in built.segments):
+                    self._templates[targets[0].id] = built
+                else:
+                    self._templates.pop(targets[0].id, None)
             new_target_ids: List[str] = []
             for target in targets:
                 for label in self._store_targets(target):
@@ -408,6 +427,160 @@ class PythonParser(LanguageParser):
                         )
                         if self.nodes.get(arg_id) and self.nodes[arg_id].is_unsafe:
                             self.nodes[callee_id].is_unsafe = True
+            self._note_ast_boundary(callee_id, callee_name, call_node)
+
+    def _note_ast_boundary(self, callee_id: str, callee_name: str, call_node: ast.Call) -> None:
+        """Record what the consuming parser will see at a Python sink.
+
+        The tree-sitter engine does this for every other language; without it
+        Python -- the primary pre-ship language here -- had no boundary analysis
+        at all. Same contract: reconstruct the consumed string, ask the
+        consumer's grammar where each value lands, and attach the verdict inputs
+        to the sink node for the taint layer to judge.
+        """
+        from analyzers.boundaries import analyse, consumer_for
+
+        mapping = consumer_for(callee_name)
+        if mapping is None:
+            return
+        _consumer, position = mapping
+        if position >= len(call_node.args):
+            return
+        template = self._build_ast_template(call_node.args[position])
+        if not template.segments or all(kind == "hole" for kind, _ in template.segments):
+            return
+        analysis = analyse(template.render(), _consumer)
+        if analysis is None:
+            return
+        node = self.nodes.get(callee_id)
+        if node is None:
+            return
+        node.metadata["boundary"] = {
+            **analysis.to_dict(),
+            **template.to_dict(),
+            "trustworthy_safe": template.complete,
+        }
+
+    def _build_ast_template(self, node: ast.AST, depth: int = 0):
+        """Reconstruct the string an ast expression builds, as literals + holes.
+
+        The ast equivalent of the tree-sitter engine's reconstruction, so the
+        boundary layer sees `f"... ORDER BY '{name}'"` and `"..." + name` as the
+        query they produce rather than an opaque value. Follows f-strings,
+        ``+`` concatenation, ``%`` and ``.format`` templating, and variable
+        indirection through templates recorded earlier; anything else becomes a
+        hole and marks the template incomplete, so a gap costs precision, not a
+        finding.
+        """
+        from analyzers.boundaries import StringTemplate
+
+        template = StringTemplate()
+        self._extend_ast_template(template, node, depth)
+        return template
+
+    def _extend_ast_template(self, template, node: ast.AST, depth: int) -> None:
+        from analyzers.boundaries import StringTemplate
+
+        if node is None or depth > 12:
+            template.complete = False
+            return
+
+        if isinstance(node, ast.Constant):
+            template.add_literal(str(node.value))
+            return
+
+        if isinstance(node, ast.JoinedStr):  # f-string
+            for value in node.values:
+                if isinstance(value, ast.Constant):
+                    template.add_literal(str(value.value))
+                elif isinstance(value, ast.FormattedValue):
+                    template.add_hole(self._expr_text(value.value))
+                else:
+                    self._extend_ast_template(template, value, depth + 1)
+            return
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            self._extend_ast_template(template, node.left, depth + 1)
+            self._extend_ast_template(template, node.right, depth + 1)
+            return
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            # `"... %s ..." % value`: the format string is the skeleton and each
+            # conversion is a hole.
+            self._extend_percent_format(template, node.left, node.right, depth)
+            return
+
+        if isinstance(node, ast.Call) and self._is_str_format(node):
+            self._extend_str_format(template, node, depth)
+            return
+
+        if isinstance(node, ast.Name):
+            recorded = self._templates.get(node.id)
+            if recorded is not None:
+                template.segments.extend(recorded.segments)
+                template.complete = template.complete and recorded.complete
+                return
+            template.add_hole(node.id)
+            return
+
+        # A call, attribute, subscript -- an opaque value that could contribute
+        # structure. Hole, and no longer trustworthy for proving safety.
+        template.complete = False
+        template.add_hole(self._expr_text(node))
+
+    def _extend_percent_format(self, template, fmt: ast.AST, values: ast.AST, depth: int) -> None:
+        import re as _re
+
+        if not isinstance(fmt, ast.Constant) or not isinstance(fmt.value, str):
+            template.complete = False
+            template.add_hole(self._expr_text(fmt))
+            return
+        operands = list(values.elts) if isinstance(values, ast.Tuple) else [values]
+        parts = _re.split(r"(%[sdrfixX%])", fmt.value)
+        index = 0
+        for part in parts:
+            if _re.fullmatch(r"%[sdrfixX]", part):
+                if index < len(operands):
+                    self._extend_ast_template(template, operands[index], depth + 1)
+                    index += 1
+                else:
+                    template.add_hole("?")
+            elif part == "%%":
+                template.add_literal("%")
+            else:
+                template.add_literal(part)
+
+    def _is_str_format(self, node: ast.Call) -> bool:
+        return (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+        )
+
+    def _extend_str_format(self, template, node: ast.Call, depth: int) -> None:
+        import re as _re
+
+        fmt = node.func.value.value  # type: ignore[union-attr]
+        parts = _re.split(r"(\{[^{}]*\})", fmt)
+        positional = list(node.args)
+        auto = 0
+        for part in parts:
+            if part.startswith("{") and part.endswith("}"):
+                if auto < len(positional):
+                    self._extend_ast_template(template, positional[auto], depth + 1)
+                    auto += 1
+                else:
+                    template.add_hole("?")
+            else:
+                template.add_literal(part)
+
+    @staticmethod
+    def _expr_text(node: ast.AST) -> str:
+        try:
+            return ast.unparse(node)[:80]
+        except Exception:
+            return type(node).__name__
 
     def _record_import(self, path: str, module_id: str, node: ast.AST) -> None:
         """Record static import bindings for later cross-file resolution."""

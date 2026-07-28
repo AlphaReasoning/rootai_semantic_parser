@@ -95,6 +95,13 @@ _FIELD_SCOPE = "__field__"
 #: prefixed with one of these names a field rather than a local.
 _INSTANCE_PREFIXES: Tuple[str, ...] = ("this.", "self.", "$this->", "this->", "@")
 
+#: Builder methods that append their argument to the receiver's contents, and
+#: the readers that return those accumulated contents. `StringBuilder`,
+#: `StringBuffer`, JS array-join builders and Python list-join all reduce to
+#: this: a string assembled across several statements, then handed to a sink.
+_BUILDER_APPENDERS = frozenset({"append", "concat", "add", "write", "insert"})
+_BUILDER_READERS = frozenset({"tostring", "build", "toboundedstring", "str"})
+
 #: Methods that store their argument into the receiver. The value is now
 #: reachable through the collection, so taint has to flow *backwards* into the
 #: receiver rather than only forwards into the call.
@@ -267,6 +274,9 @@ class GenericTreeSitterParser(TreeSitterParser):
         #: sink handed a variable can still be told what the consuming parser
         #: will see. `sql = "..." + p; execute(sql)` is the ordinary shape.
         self._templates: Dict[Tuple[str, str], Any] = {}
+        #: (scope, name) -> the template a StringBuilder-style variable has
+        #: accumulated so far, updated as each `.append()` statement is walked.
+        self._builders: Dict[Tuple[str, str], Any] = {}
 
     @classmethod
     def supports(cls, path: str) -> bool:
@@ -300,6 +310,7 @@ class GenericTreeSitterParser(TreeSitterParser):
         self._field_names = self._collect_field_names(tree.root_node, source)
         self._constants = {}
         self._templates = {}
+        self._builders = {}
         self._root_node = tree.root_node
         self._assignment_targets = self._collect_assignment_targets(tree.root_node)
 
@@ -342,6 +353,7 @@ class GenericTreeSitterParser(TreeSitterParser):
             self._note_route_registration(node, src, path, fn_id)
 
         if node_type in self.profile.call_nodes:
+            self._note_builder_append(node, src, fn_id)
             self._visit_call(node, src, path, fn_id)
 
         if node_type in self.profile.exit_nodes:
@@ -449,6 +461,15 @@ class GenericTreeSitterParser(TreeSitterParser):
             template.add_hole(text[:80])
             return
 
+        # A StringBuilder read (`sb.toString()`) or an append chain resolves to
+        # the string that was assembled into it, so the consumed query is
+        # recovered even though it was never a single literal.
+        builder = self._resolve_builder(node, src, fn_id)
+        if builder is not None:
+            template.segments.extend(builder.segments)
+            template.complete = template.complete and builder.complete
+            return
+
         # Anything else -- a call, a subscript, an unresolved expression -- could
         # itself contribute *structure* to the consumed language, not just a
         # value: `"... " + build() + " ..."` where build() returns `x ORDER BY`
@@ -458,6 +479,133 @@ class GenericTreeSitterParser(TreeSitterParser):
         # this incomplete only forgoes a suppression, never a finding.
         template.complete = False
         template.add_hole(text[:80])
+
+    def _resolve_builder(self, node, src: str, fn_id: str, depth: int = 0):
+        """Return the template a StringBuilder-style expression assembles.
+
+        Three forms, all reducing to "contents so far, plus this argument":
+
+        * ``sb.toString()`` -- read: the receiver's accumulated contents.
+        * ``x.append(a).append(b)`` -- a fluent chain, resolved base-outward.
+        * ``sb`` (a bare name) -- the template accumulated for it by the
+          statement-separated appends visited earlier.
+
+        Returns ``None`` when the node is not a builder expression, so the
+        caller falls through to its ordinary handling.
+        """
+        from analyzers.boundaries import StringTemplate
+
+        if node is None or depth > 16:
+            return None
+
+        # A bare name: its accumulated template, if any statement built one.
+        if node.type in self.profile.identifier_nodes:
+            name = self._get_text(src, node).strip().lstrip("$@")
+            recorded = self._builders.get((fn_id, name)) or self._builders.get((_FIELD_SCOPE, name))
+            return recorded
+
+        if node.type not in self.profile.call_nodes:
+            return None
+
+        callee_text, arguments = self._call_parts(node, src)
+        if not callee_text:
+            return None
+        receiver_node, method = self._call_receiver(node, src)
+        method = method.lower()
+
+        # `new StringBuilder("seed")` -- constructor content, or empty.
+        if node.type in _CONSTRUCTION_NODES or "stringbuilder" in callee_text.lower() or "stringbuffer" in callee_text.lower():
+            template = StringTemplate()
+            operands = [c for c in (arguments.children if arguments else []) if c.is_named]
+            if operands:
+                self._extend_template(template, operands[0], src, fn_id, depth + 1)
+            return template
+
+        if method in _BUILDER_READERS:
+            return self._resolve_builder(receiver_node, src, fn_id, depth + 1)
+
+        if method in _BUILDER_APPENDERS:
+            base = self._resolve_builder(receiver_node, src, fn_id, depth + 1)
+            if base is None:
+                return None
+            template = StringTemplate(list(base.segments), base.complete)
+            operands = [c for c in (arguments.children if arguments else []) if c.is_named]
+            if operands:
+                self._extend_template(template, operands[0], src, fn_id, depth + 1)
+            return template
+
+        return None
+
+    def _call_receiver(self, node, src: str):
+        """Return ``(receiver node, method name)`` for a method call.
+
+        For `a.b(x)` the receiver is `a` and the method is `b`; for a chain
+        `a.b(x).c(y)` the receiver of the outer call is the whole `a.b(x)`
+        sub-expression, which is what lets a fluent builder resolve base-outward.
+        """
+        children = [c for c in node.children if c.type not in self.profile.argument_container_nodes]
+        method = ""
+        for child in children:
+            if child.type in self.profile.identifier_nodes:
+                method = self._get_text(src, child).strip()
+        receiver = children[0] if children and children[0] is not (children[-1] if children else None) else None
+        # The receiver is everything left of the final `.method`; the first
+        # child covers both `sb` and a nested `sb.append(x)` call node.
+        if children and children[0].type not in {".", "->"}:
+            receiver = children[0]
+        return receiver, method
+
+    def _note_builder_init(self, name: str, scope: str, fn_id: str, value_nodes: List[Any], src: str) -> None:
+        """Seed a builder's accumulated template from its constructor.
+
+        `new StringBuilder("SELECT ... ORDER BY ")` starts the builder with that
+        text, so a later `.append(sort)` extends it rather than replacing it.
+        Without seeding, the first append began from empty and the seed literal
+        -- often the entire query skeleton -- was lost, and the position of
+        every appended value with it.
+        """
+        key = (_FIELD_SCOPE if scope == _FIELD_SCOPE else fn_id, name)
+        if len(value_nodes) != 1:
+            self._builders.pop(key, None)
+            return
+        node = value_nodes[0]
+        text = self._get_text(src, node).lower()
+        if node.type not in _CONSTRUCTION_NODES and "stringbuilder" not in text and "stringbuffer" not in text:
+            self._builders.pop(key, None)
+            return
+        seeded = self._resolve_builder(node, src, fn_id)
+        if seeded is not None:
+            self._builders[key] = seeded
+
+    def _note_builder_append(self, node, src: str, fn_id: str) -> None:
+        """Accumulate a statement-separated append into its named builder.
+
+        `sb.append("SELECT ... ORDER BY "); sb.append(sort);` builds `sb` across
+        two statements. Visited in source order, so appending as they are seen
+        keeps the assembled string in the right order. Fluent chains do not need
+        this -- they are resolved structurally at read time -- but the common
+        Java idiom is statement-separated and would otherwise never resolve.
+        """
+        from analyzers.boundaries import StringTemplate
+
+        callee_text, arguments = self._call_parts(node, src)
+        if not callee_text or arguments is None or "." not in callee_text:
+            return
+        receiver, _, method = callee_text.rpartition(".")
+        receiver = receiver.strip()
+        if method.strip().lower() not in _BUILDER_APPENDERS or not _PLAIN_NAME.match(receiver):
+            return
+        name = receiver.lstrip("$@")
+        key = (
+            _FIELD_SCOPE if (_FIELD_SCOPE, name) in self._builders and (fn_id, name) not in self._builders else fn_id,
+            name,
+        )
+        existing = self._builders.get((fn_id, name)) or self._builders.get((_FIELD_SCOPE, name))
+        template = existing if existing is not None else StringTemplate()
+        operands = [c for c in arguments.children if c.is_named]
+        if operands:
+            self._extend_template(template, operands[0], src, fn_id, 0)
+        self._builders[key] = template
 
     def _extend_literal(self, template, node, src: str, fn_id: str, depth: int) -> None:
         """Split a literal into its fixed text and its interpolations.
@@ -878,6 +1026,7 @@ class GenericTreeSitterParser(TreeSitterParser):
             lineno = node.start_point[0] + 1
             self._record_constant(name, target_scope, fn_id, value_nodes, src)
             self._record_template(name, target_scope, fn_id, value_nodes, src)
+            self._note_builder_init(name, target_scope, fn_id, value_nodes, src)
             var_id = self._declare_value(name, path, fn_id, lineno, "binding", target_scope)
             if is_source:
                 self.nodes[var_id].is_unsafe = True

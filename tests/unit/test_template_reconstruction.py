@@ -290,13 +290,9 @@ def test_single_quoted_php_really_is_constant() -> None:
     assert boundary["no_holes"] is True
 
 
-@pytest.mark.xfail(
-    reason="Python is parsed by the ast-based engine in parsers/engines.py, which "
-    "does not yet reconstruct templates. Recorded rather than hidden: the "
-    "capability is absent for Python, not silently degraded.",
-    strict=True,
-)
-def test_python_fstring_boundary_is_not_yet_supported() -> None:
+def test_python_fstring_boundary_is_reconstructed() -> None:
+    """The ast engine now reconstructs templates, so Python -- the primary
+    pre-ship language here -- has boundary analysis like the rest."""
     boundary = _one(
         "a.py",
         "def v(request):\n"
@@ -304,3 +300,14 @@ def test_python_fstring_boundary_is_not_yet_supported() -> None:
         "    cur.execute(f\"SELECT * FROM t WHERE n = '{c}'\")\n",
     )
     assert _positions(boundary) == ["sql:quoted-literal"]
+
+
+def test_python_percent_and_format_reconstruct() -> None:
+    for source in (
+        "def v(request):\n    n = request.args.get('n')\n"
+        "    cur.execute('SELECT * FROM t ORDER BY %s' % n)\n",
+        "def v(request):\n    n = request.args.get('n')\n"
+        "    cur.execute('SELECT * FROM t ORDER BY {}'.format(n))\n",
+    ):
+        boundary = _one("a.py", source)
+        assert _positions(boundary) == ["sql:identifier"], boundary["template"]

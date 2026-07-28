@@ -351,8 +351,10 @@ SINK_CONSUMERS: Dict[str, Tuple[str, int]] = {
     # SQL
     "executequery": ("sql", 0), "executeupdate": ("sql", 0), "preparestatement": ("sql", 0),
     "createquery": ("sql", 0), "rawquery": ("sql", 0), "nativequery": ("sql", 0),
-    "cursor.execute": ("sql", 0), "conn.execute": ("sql", 0), "connection.execute": ("sql", 0),
-    "session.execute": ("sql", 0), "stmt.execute": ("sql", 0), "statement.execute": ("sql", 0),
+    "cursor.execute": ("sql", 0), "cur.execute": ("sql", 0), "conn.execute": ("sql", 0),
+    "connection.execute": ("sql", 0), "session.execute": ("sql", 0),
+    "stmt.execute": ("sql", 0), "statement.execute": ("sql", 0),
+    "executescript": ("sql", 0), "executemany": ("sql", 0),
     "db.query": ("sql", 0), "db.exec": ("sql", 0), "sequelize.query": ("sql", 0),
     "knex.raw": ("sql", 0), "mysqli_query": ("sql", 1), "pg_query": ("sql", 1),
     "sqlx::query": ("sql", 0), "sqlcommand": ("sql", 0),

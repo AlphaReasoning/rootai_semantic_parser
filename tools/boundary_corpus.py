@@ -442,7 +442,6 @@ CASES: List[Case] = [
         is_vulnerable=True,
         rationale="StringBuilder-assembled query; the value is still an ORDER BY identifier",
         provenance="synthetic: StringBuilder query assembly",
-        known_gap=True,  # reconstruction does not follow .append() chains yet
     ),
     _c(
         id="sql_allowlist_guard_js",
@@ -462,7 +461,7 @@ CASES: List[Case] = [
         provenance="synthetic: allowlist guard at identifier position",
     ),
     # -----------------------------------------------------------------------
-    # Known gaps -- scored apart so the headline stays honest
+    # Python host language, via the ast engine's own reconstruction
     # -----------------------------------------------------------------------
     _c(
         id="python_fstring_literal",
@@ -476,9 +475,38 @@ CASES: List[Case] = [
         expect_position="sql:quoted-literal",
         expect_verdict=UNDEFENDED,
         is_vulnerable=True,
-        rationale="Python is parsed by the ast engine, which has no template reconstruction yet",
-        provenance="synthetic: known gap, Python host language",
-        known_gap=True,
+        rationale="f-string interpolation into a quoted literal; ast engine reconstructs it",
+        provenance="synthetic: Python f-string SQL injection",
+    ),
+    _c(
+        id="python_fstring_orderby",
+        filename="python_fstring_orderby.py",
+        source=(
+            "def view(request):\n"
+            "    sort = request.args.get('sort')\n"
+            "    cur.execute(f\"SELECT * FROM products ORDER BY {sort}\")\n"
+        ),
+        consumer="sql",
+        expect_position="sql:identifier",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="f-string into an ORDER BY identifier; escaping cannot help",
+        provenance="synthetic: Python ORDER BY injection",
+    ),
+    _c(
+        id="python_parameterised_safe",
+        filename="python_parameterised.py",
+        source=(
+            "def view(request):\n"
+            "    n = request.args.get('n')\n"
+            "    cur.execute('SELECT * FROM t WHERE n = ?', (n,))\n"
+        ),
+        consumer="sql",
+        expect_position=None,
+        expect_verdict=SAFE,
+        is_vulnerable=False,
+        rationale="a ? placeholder with the value passed separately is parameterised",
+        provenance="synthetic: Python parameterised query (negative control)",
     ),
 ]
 
