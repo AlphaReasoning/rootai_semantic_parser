@@ -549,6 +549,18 @@ class TaintAnalyzer:
             score -= 40.0
         if self.options.suppress_dead_code and dead_code:
             score -= 25.0
+        boundary = self._boundary_verdict(nodes, sink_node)
+        if boundary is not None:
+            score += boundary["score_adjustment"]
+            # The boundary layer knows *which* defence is present and whether it
+            # fits the position, which is a finer judgement than the category
+            # match behind `sanitized`. Let it correct that flag: a MISMATCH is
+            # a live finding the sanitiser only appeared to defend, and a
+            # trustworthy SAFE is defended in a way category matching missed.
+            if boundary["outcome"] == "MISMATCH":
+                sanitized = False
+            elif boundary["outcome"] == "SAFE" and boundary["trustworthy_safe"]:
+                sanitized = True
         confidence = score / 100.0
         sanitization_status = "none_detected" if not sanitized else "sanitized_detected"
         source_label = labels[0] if labels else ""
@@ -576,7 +588,114 @@ class TaintAnalyzer:
             "dead_code": dead_code,
             "library_code": is_library_path,
             "path_labels": labels,
+            "boundary": boundary,
         }
+
+    def _boundary_verdict(self, nodes: List[Dict], sink_node: Dict) -> Optional[Dict[str, Any]]:
+        """Judge the sink's grammatical boundary against the defences on the path.
+
+        The parser recorded, on the sink, what the consuming language parses and
+        where each runtime value lands in it. Here that is compared against the
+        sanitisers actually seen on this path, yielding the verdict a dynamic
+        prober downstream can act on -- position, required defence, and whether
+        the applied defence fits.
+
+        The score adjustment expresses the point of the whole layer. A MISMATCH
+        (a real defence, wrong for the position) and an undefended structural
+        position (an ORDER BY identifier, a script body) are promoted, because
+        both look defended or harmless to everything that reasons by sink name.
+        A trustworthy SAFE is suppressed, because it is provably not injectable.
+        An incomplete reconstruction can locate danger but never prove safety,
+        so its SAFE never suppresses.
+        """
+        from analyzers import boundaries
+
+        boundary_meta = (sink_node.get("metadata") or {}).get("boundary")
+        if not boundary_meta:
+            return None
+
+        analysis = boundaries.BoundaryAnalysis(
+            consumer=boundary_meta.get("consumer", ""),
+            template=boundary_meta.get("template", ""),
+            no_holes=boundary_meta.get("no_holes", False),
+        )
+        for hole in boundary_meta.get("holes", []):
+            position = boundaries.Position(
+                name=hole.get("position", ""),
+                accepts=frozenset(hole.get("accepts", [])),
+                rationale=hole.get("rationale", ""),
+                structural=hole.get("structural", False),
+            )
+            analysis.holes.append(
+                boundaries.Hole(index=hole.get("index", 0), position=position,
+                                chain=tuple(hole.get("grammar_path", [])))
+            )
+
+        # Transformations the value passed through, which are the intermediate
+        # call nodes -- not the source and not the sink. The boundary layer's
+        # own defence vocabulary is finer than the taint sanitiser set (segment
+        # matching treats `mysqli_real_escape_string` as one token and so never
+        # matched `real_escape_string`), so pass the raw labels and let
+        # `capabilities_of` classify them.
+        applied = [
+            str(node.get("label", ""))
+            for node in nodes[1:-1]
+            if node.get("type") == "Function" or self._is_sanitizer(node)
+        ]
+        verdict = boundaries.judge(analysis, applied)
+        trustworthy_safe = bool(boundary_meta.get("trustworthy_safe", True))
+
+        adjustment = 0.0
+        if verdict.outcome == boundaries.MISMATCH:
+            # The finding nothing else reports: defended, but wrong-defended.
+            adjustment = 25.0
+        elif verdict.outcome == boundaries.UNDEFENDED and verdict.hole and verdict.hole.position.structural:
+            # An identifier position or a script body with no defence at all.
+            adjustment = 15.0
+        elif verdict.outcome == boundaries.SAFE and trustworthy_safe:
+            # Provably not injectable at this boundary.
+            adjustment = -45.0
+
+        result = verdict.to_dict()
+        result.update(
+            {
+                "consumer": analysis.consumer,
+                "template": boundary_meta.get("template", ""),
+                "template_complete": boundary_meta.get("complete", True),
+                "trustworthy_safe": trustworthy_safe,
+                "probe": self._probe_for(verdict, analysis),
+                "score_adjustment": adjustment,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _probe_for(verdict, analysis) -> Optional[str]:
+        """The concrete test this position invites, for a downstream prober.
+
+        A static finding that carries its own confirmation recipe is what makes
+        the stack more than a pile of separate tools: the dynamic leg is handed
+        "break out of a single-quoted SQL literal", not "try SQL injection".
+        """
+        from analyzers import boundaries
+
+        if verdict.hole is None:
+            return None
+        name = verdict.hole.position.name
+        probes = {
+            "sql:quoted-literal": "inject an unbalanced single quote and observe a SQL error or altered result",
+            "sql:unquoted-value": "append ` OR 1=1` / a stacked `; SELECT pg_sleep(5)--`",
+            "sql:identifier": "supply a non-column token in the ORDER BY / table slot; escaping cannot stop it",
+            "shell:unquoted-argument": "inject `; id`, `$(id)`, or a pipe",
+            "shell:command-name": "substitute another command name entirely",
+            "html:text": "inject `<script>` and confirm it is not entity-encoded",
+            "html:attribute-value": "break out of the attribute with `\"><script>`",
+            "html:url-attribute": "supply a `javascript:` URL, which escaping permits",
+            "html:script-body": "close the script string and inject JS; HTML escaping does not apply here",
+        }
+        if verdict.outcome in (boundaries.MISMATCH, boundaries.UNDEFENDED):
+            return probes.get(name)
+        return None
 
     @staticmethod
     def _impact_for_sink(label: str) -> str:
@@ -740,6 +859,7 @@ class TaintAnalyzer:
                         source_label=metadata["source_label"],
                         sink_label=metadata["sink_label"],
                         explanation=metadata["explanation"],
+                        boundary=metadata["boundary"],
                     )
                 )
 

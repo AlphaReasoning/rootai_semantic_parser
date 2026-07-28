@@ -100,6 +100,13 @@ def _build_cli() -> argparse.ArgumentParser:
     poc_parser.add_argument("--collaborator", default="")
     poc_parser.add_argument("--out", help="Write report to file instead of stdout")
 
+    explain_parser = sub.add_parser(
+        "explain",
+        help="Emit confirmation-ready evidence bundles for downstream tools/AI",
+    )
+    explain_parser.add_argument("--out", help="Write report to file instead of stdout")
+    explain_parser.add_argument("--limit", type=int, default=50, help="Max findings to bundle")
+
     web_parser = sub.add_parser("web-ui", help="Render a standalone interactive web UI HTML report")
     web_parser.add_argument("--out", help="Write report to file instead of stdout")
 
@@ -259,7 +266,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         parser.parse_all()
         return parser.get_graph()
 
-    if args.command in {"scan", "bounty-report", "ci-scan", "submit-report", "poc", "web-ui"}:
+    if args.command in {"scan", "bounty-report", "ci-scan", "submit-report", "poc", "web-ui", "explain"}:
         cve_enricher = CVEEnricher.from_feed(args.cve_feed) if getattr(args, "cve_feed", None) else None
         external_graphs = []
         if getattr(args, "dependencies", None):
@@ -293,6 +300,12 @@ def _main(argv: Optional[List[str]] = None) -> int:
             output = render_bounty_output(bounty, args.format)
         elif args.command == "submit-report":
             output = bounty_report_to_submission_markdown(bounty, args.platform, collaborator_base=args.collaborator)
+        elif args.command == "explain":
+            from analyzers.evidence import build_evidence_report
+
+            output = json.dumps(
+                build_evidence_report(bounty.findings, limit=args.limit), indent=2
+            )
         elif args.command == "poc":
             output = json.dumps([generate_poc_hints(finding, collaborator_base=args.collaborator) for finding in bounty.findings[:10]], indent=2)
         elif args.command == "web-ui":

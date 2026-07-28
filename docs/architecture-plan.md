@@ -119,12 +119,22 @@ consumer grammar and which argument index is consumed.
 *Check*: every sink in the bugbounty profile either maps to a consumer or is
 explicitly recorded as unmapped, with no silent gaps.
 
-### Step 4 — Wire verdicts into findings
-Boundary verdict becomes part of the taint path: `SAFE` suppresses or
-downgrades, `MISMATCH` promotes above ordinary undefended flows, evidence rides
-along on the finding.
-*Check*: OWASP Benchmark precision must not regress (regression floor, not a
-target); DVWA `impossible.php` and the Flask/Requests noise floor hold.
+### Step 4 — Wire verdicts into findings ✅
+Boundary verdict is part of the taint path. `MISMATCH` (+25) and undefended
+structural positions (+15) are promoted; a trustworthy `SAFE` (−45) is
+suppressed; an incomplete reconstruction never suppresses. The verdict corrects
+the taint `sanitized` flag, because the boundary layer knows *which* defence is
+present and whether it fits. `semantic-parser explain` emits the L4 evidence
+bundle — position, required defence, route, the question to answer, and the
+probe that answers it — as the handoff to the confirming step.
+*Check*: 369 tests; OWASP Benchmark held exactly (58.1/68.8/+25.0), corpus
+green including DVWA `impossible.php`.
+
+Where this sits in the larger stack: this is the **white-box leg** — source in,
+ranked candidates out, without running anything. Its job is not to be right
+alone but to hand the dynamic/confirmation leg a finding that already carries
+its own test recipe, so the two tools compose instead of re-deriving each
+other's work. The evidence bundle is that interface.
 
 ### Step 5 — Corpus for what this actually does
 Benchmark cannot measure boundary reasoning; it has no `ORDER BY` injection, no

@@ -1060,6 +1060,14 @@ class TaintPath:
     source_label: str = ""
     sink_label: str = ""
     explanation: str = ""
+    #: Grammar-boundary verdict for this sink, when the consuming language is
+    #: modelled. Carries the reconstructed template, the position each value
+    #: lands in, the defence that position requires, and -- when a defence *was*
+    #: applied and is the wrong kind for the position -- a ``MISMATCH``. This is
+    #: what a dynamic prober downstream turns into an actual test: not "try SQLi
+    #: here" but "the hole is a single-quoted literal, so the probe is a quote
+    #: break". ``None`` when no consuming grammar was identified.
+    boundary: Optional[Dict[str, Any]] = None
 
     def summary(self, node_idx: Dict[str, Dict[str, Any]]) -> str:
         """Render a short path summary."""

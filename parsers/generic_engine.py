@@ -444,6 +444,19 @@ class GenericTreeSitterParser(TreeSitterParser):
                 template.segments.extend(recorded.segments)
                 template.complete = template.complete and recorded.complete
                 return
+            # A bare name is the value being classified: its position is the
+            # finding, and the surrounding skeleton is still fully known.
+            template.add_hole(text[:80])
+            return
+
+        # Anything else -- a call, a subscript, an unresolved expression -- could
+        # itself contribute *structure* to the consumed language, not just a
+        # value: `"... " + build() + " ..."` where build() returns `x ORDER BY`
+        # would move every later hole to the wrong position. We cannot see
+        # inside it, so the reconstruction is no longer trustworthy for proving
+        # safety. It can still locate danger; it just must not suppress. Marking
+        # this incomplete only forgoes a suppression, never a finding.
+        template.complete = False
         template.add_hole(text[:80])
 
     def _extend_literal(self, template, node, src: str, fn_id: str, depth: int) -> None:
