@@ -461,6 +461,78 @@ CASES: List[Case] = [
         provenance="synthetic: allowlist guard at identifier position",
     ),
     # -----------------------------------------------------------------------
+    # XPath -- hand-written classifier (no tree-sitter grammar)
+    # -----------------------------------------------------------------------
+    _c(
+        id="xpath_string_literal_undefended_java",
+        filename="XPathStringUndefended.java",
+        source=(
+            "public class XPathStringUndefended {\n"
+            "  public void run(HttpServletRequest r) throws Exception {\n"
+            "    String id = r.getParameter(\"id\");\n"
+            "    String expr = \"/Employees/Employee[@emplid='\" + id + \"']\";\n"
+            "    String result = xp.evaluate(expr, xmlDocument);\n  }\n}\n"
+        ),
+        consumer="xpath",
+        expect_position="xpath:string-literal",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="value in an XPath string literal with no encoding; break out with a quote",
+        provenance="synthetic: XPath injection in a string literal",
+    ),
+    _c(
+        id="xpath_string_literal_encoded_java",
+        filename="XPathStringEncoded.java",
+        source=(
+            "public class XPathStringEncoded {\n"
+            "  public void run(HttpServletRequest r) throws Exception {\n"
+            "    String id = ESAPI.encoder().encodeForXPath(r.getParameter(\"id\"));\n"
+            "    String expr = \"/Employees/Employee[@emplid='\" + id + \"']\";\n"
+            "    String result = xp.evaluate(expr, xmlDocument);\n  }\n}\n"
+        ),
+        consumer="xpath",
+        expect_position="xpath:string-literal",
+        expect_verdict=SAFE,
+        is_vulnerable=False,
+        rationale="encodeForXPath fits a string-literal position",
+        provenance="synthetic: correctly-encoded XPath literal (negative control)",
+    ),
+    # -----------------------------------------------------------------------
+    # LDAP -- hand-written classifier
+    # -----------------------------------------------------------------------
+    _c(
+        id="ldap_filter_value_undefended_java",
+        filename="LdapFilterUndefended.java",
+        source=(
+            "public class LdapFilterUndefended {\n"
+            "  public void run(HttpServletRequest r) throws Exception {\n"
+            "    String name = r.getParameter(\"name\");\n"
+            "    String filter = \"(uid=\" + name + \")\";\n"
+            "    idc.search(base, filter, filters, sc);\n  }\n}\n"
+        ),
+        consumer="ldap",
+        expect_position="ldap:filter-value",
+        expect_verdict=UNDEFENDED,
+        is_vulnerable=True,
+        rationale="value in an LDAP filter with no escaping; `*)(uid=*` breaks out",
+        provenance="synthetic: LDAP injection in a filter value",
+    ),
+    _c(
+        id="ldap_filter_value_encoded_php",
+        filename="ldap_filter_encoded.php",
+        source=(
+            "<?php\n$user = ldap_escape($_GET['user'], '', LDAP_ESCAPE_FILTER);\n"
+            "$filter = \"(uid=\" . $user . \")\";\n"
+            "ldap_search($conn, $base, $filter);\n"
+        ),
+        consumer="ldap",
+        expect_position="ldap:filter-value",
+        expect_verdict=SAFE,
+        is_vulnerable=False,
+        rationale="ldap_escape with LDAP_ESCAPE_FILTER fits a filter-value position",
+        provenance="synthetic: correctly-escaped LDAP filter (negative control)",
+    ),
+    # -----------------------------------------------------------------------
     # Python host language, via the ast engine's own reconstruction
     # -----------------------------------------------------------------------
     _c(

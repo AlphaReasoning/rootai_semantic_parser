@@ -174,6 +174,61 @@ def test_javascript_escaping_defends_a_script_body() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# XPath and LDAP: hand-written classifiers, no tree-sitter grammar
+# ---------------------------------------------------------------------------
+
+XPATH_POSITIONS = {
+    "string literal": (f"/Employees/Employee[@id='{H}']", "xpath:string-literal"),
+    "predicate expression": (f"/users/user[{H}]", "xpath:expression"),
+    "node name": (f"//{H}/text()", "xpath:node-name"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(XPATH_POSITIONS))
+def test_xpath_position_is_identified(case: str) -> None:
+    template, expected = XPATH_POSITIONS[case]
+    verdict = _verdict(template, "xpath", [])
+    assert verdict.hole is not None and verdict.hole.position.name == expected
+
+
+def test_xpath_encoder_defends_a_string_literal() -> None:
+    assert _verdict(f"/user[@id='{H}']", "xpath", ["encodeForXPath"]).outcome == SAFE
+
+
+def test_xpath_encoder_does_not_defend_a_node_name() -> None:
+    """A node-name position is structural; escaping the value cannot constrain
+    which nodes it selects."""
+    verdict = _verdict(f"//{H}/text()", "xpath", ["encodeForXPath"])
+    assert verdict.outcome == MISMATCH
+    assert verdict.hole is not None and verdict.hole.position.structural
+
+
+LDAP_POSITIONS = {
+    "filter value": (f"(uid={H})", "ldap:filter-value"),
+    "value in and-group": (f"(&(uid={H})(objectClass=person))", "ldap:filter-value"),
+    "attribute name": (f"({H}=admin)", "ldap:filter-structure"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(LDAP_POSITIONS))
+def test_ldap_position_is_identified(case: str) -> None:
+    template, expected = LDAP_POSITIONS[case]
+    verdict = _verdict(template, "ldap", [])
+    assert verdict.hole is not None and verdict.hole.position.name == expected
+
+
+def test_ldap_encoder_defends_a_filter_value() -> None:
+    assert _verdict(f"(uid={H})", "ldap", ["encodeForLDAP"]).outcome == SAFE
+
+
+def test_ldap_encoder_does_not_defend_the_filter_structure() -> None:
+    """Escaping a value does nothing when the value is the attribute name."""
+    verdict = _verdict(f"({H}=admin)", "ldap", ["encodeForLDAP"])
+    assert verdict.outcome == MISMATCH
+    assert verdict.hole is not None and verdict.hole.position.structural
+
+
 def test_an_unknown_consumer_yields_no_analysis() -> None:
     """Callers fall back to ordinary taint reasoning; nothing is suppressed."""
     assert analyse(f"foo {H}", "brainfuck") is None

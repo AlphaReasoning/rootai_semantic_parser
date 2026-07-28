@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 #: Token substituted for a runtime value. Must survive tokenisation as a plain
 #: identifier in every consumer grammar, so no punctuation and no keywords.
@@ -121,6 +121,8 @@ HTML_ATTR_ESCAPE = "html-attr-escape"
 JS_STRING_ESCAPE = "js-string-escape"
 URL_SCHEME_CHECK = "url-scheme-check"
 CSS_ESCAPE = "css-escape"
+XPATH_ESCAPE = "xpath-escape"
+LDAP_ESCAPE = "ldap-escape"
 REJECT = "reject"
 
 #: Sanitiser names mapped to the capability they provide. A defence absent here
@@ -162,6 +164,14 @@ DEFENCE_CAPABILITIES: Dict[str, FrozenSet[str]] = {
     "encodeforurl": frozenset({URL_SCHEME_CHECK}),
     "encodeurlcomponent": frozenset({URL_SCHEME_CHECK}),
     "encodeforcss": frozenset({CSS_ESCAPE}),
+    # XPath and LDAP encoders. XPath 1.0 has no way to escape a quote inside a
+    # string literal, so ESAPI's encodeForXPath is the only escaping defence and
+    # variable binding is the robust one.
+    "encodeforxpath": frozenset({XPATH_ESCAPE}),
+    "encodeforldap": frozenset({LDAP_ESCAPE}),
+    "encodefordn": frozenset({LDAP_ESCAPE}),
+    "ldap_escape": frozenset({LDAP_ESCAPE}),
+    "escapeldapsearchfilter": frozenset({LDAP_ESCAPE}),
 }
 
 
@@ -314,20 +324,128 @@ HTML_RULES = (
 URL_ATTRIBUTES = frozenset({"href", "src", "action", "formaction", "data", "poster", "srcdoc", "xlink:href"})
 
 
+# ---------------------------------------------------------------------------
+# XPath and LDAP -- no tree-sitter grammar, so classified by a focused scan.
+#
+# Both languages are regular enough that a character-level scan of the template
+# up to each hole identifies its position reliably. The same principle holds as
+# for SQL: a value inside a string literal needs escaping; a value in a
+# structural slot (a node name, a filter attribute, an operator) cannot be
+# defended by escaping at all.
+# ---------------------------------------------------------------------------
+
+XPATH_STRING = Position(
+    "xpath:string-literal",
+    frozenset({XPATH_ESCAPE, PARAMETERISE, NUMERIC_CAST}),
+    "inside an XPath string literal; XPath 1.0 cannot escape the quote, so variable binding is the robust fix",
+)
+XPATH_EXPRESSION = Position(
+    "xpath:expression",
+    frozenset({PARAMETERISE, NUMERIC_CAST, ALLOWLIST}),
+    "an XPath expression or predicate operand outside any string; escaping does not apply",
+    structural=True,
+)
+XPATH_NODE = Position(
+    "xpath:node-name",
+    frozenset({ALLOWLIST, NUMERIC_CAST}),
+    "a node or axis name; the value selects which nodes are addressed and no escaping constrains it",
+    structural=True,
+)
+
+LDAP_VALUE = Position(
+    "ldap:filter-value",
+    frozenset({LDAP_ESCAPE, NUMERIC_CAST}),
+    "an LDAP assertion value; escaping '*()\\\\' and NUL closes it",
+)
+LDAP_STRUCTURE = Position(
+    "ldap:filter-structure",
+    frozenset({ALLOWLIST, NUMERIC_CAST}),
+    "an LDAP attribute name or filter operator; the value alters the filter itself, which escaping cannot stop",
+    structural=True,
+)
+
+
+def _classify_xpath(text: str, offset: int) -> Position:
+    """Position of a hole in an XPath expression, by scanning up to ``offset``.
+
+    Tracks quote state and predicate depth in one pass. Inside a string literal
+    the value needs escaping/binding; inside a predicate but outside a string it
+    is an expression operand; a value adjacent to ``/`` or ``@`` selects a node
+    name.
+    """
+    quote = None
+    depth = 0
+    for char in text[:offset]:
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+    if quote:
+        return XPATH_STRING
+    # A node-name position is one written straight after a path or axis step
+    # with no comparison in between. Look at the character before the hole.
+    before = text[:offset].rstrip()
+    if before.endswith("/") or before.endswith("@") or before.endswith("::"):
+        return XPATH_NODE
+    if depth > 0:
+        return XPATH_EXPRESSION
+    return XPATH_NODE
+
+
+def _classify_ldap(text: str, offset: int) -> Position:
+    """Position of a hole in an LDAP filter, by scanning up to ``offset``.
+
+    An LDAP filter is ``(attr op value)``. Within the innermost open paren, a
+    hole after a comparison operator is a value; a hole before any operator is
+    the attribute name; a hole not inside a paren at all is filter structure.
+    All but the value position are structural.
+    """
+    # Find the start of the innermost unclosed group before the hole.
+    depth = 0
+    group_start = None
+    for index, char in enumerate(text[:offset]):
+        if char == "(":
+            depth += 1
+            group_start = index
+        elif char == ")":
+            depth -= 1
+            group_start = None
+    if group_start is None:
+        return LDAP_STRUCTURE
+    segment = text[group_start + 1 : offset]
+    # A logical group `(&`, `(|`, `(!` contains sub-filters, not a value.
+    if segment[:1] in "&|!":
+        return LDAP_STRUCTURE
+    if any(op in segment for op in ("=", "~=", ">=", "<=", "<", ">")):
+        return LDAP_VALUE
+    return LDAP_STRUCTURE
+
+
 @dataclass(frozen=True)
 class Consumer:
     name: str
+    #: tree-sitter grammar name, or "" for a hand-written classifier.
     grammar: str
-    rules: Tuple[Rule, ...]
+    rules: Tuple[Rule, ...] = ()
     #: Wrapper text needed to make a fragment parse on its own.
     prefix: str = ""
     suffix: str = ""
+    #: ``(text, hole offset) -> Position`` for languages with no tree-sitter
+    #: grammar. When set, it is used instead of grammar parsing.
+    classify: Optional[Callable[[str, int], "Position"]] = None
 
 
 CONSUMERS: Dict[str, Consumer] = {
     "sql": Consumer("sql", "sql", SQL_RULES),
     "shell": Consumer("shell", "bash", SHELL_RULES),
     "html": Consumer("html", "html", HTML_RULES),
+    "xpath": Consumer("xpath", "", classify=_classify_xpath),
+    "ldap": Consumer("ldap", "", classify=_classify_ldap),
 }
 
 
@@ -370,6 +488,15 @@ SINK_CONSUMERS: Dict[str, Tuple[str, int]] = {
     "document.write": ("html", 0), "dangerouslysetinnerhtml": ("html", 0),
     "getwriter.println": ("html", 0), "getwriter.write": ("html", 0), "getwriter.print": ("html", 0),
     "res.send": ("html", 0), "res.write": ("html", 0), "render_template_string": ("html", 0),
+    # XPath -- the expression is the first argument to evaluate/compile.
+    "xpath.evaluate": ("xpath", 0), "xp.evaluate": ("xpath", 0),
+    "xpathexpression.evaluate": ("xpath", 0), "xpath.compile": ("xpath", 0),
+    "selectnodes": ("xpath", 0), "selectsinglenode": ("xpath", 0),
+    # LDAP -- Java's DirContext.search takes the filter as its second argument;
+    # PHP's ldap_search takes it third.
+    "dircontext.search": ("ldap", 1), "initialdircontext.search": ("ldap", 1),
+    "ldapcontext.search": ("ldap", 1), "idc.search": ("ldap", 1), "ctx.search": ("ldap", 1),
+    "ldap_search": ("ldap", 2), "ldap_list": ("ldap", 2),
 }
 
 #: Sinks whose argument is not parsed as another language at all. Recorded so
@@ -468,22 +595,30 @@ def analyse(template: str, consumer_name: str) -> Optional[BoundaryAnalysis]:
     consumer = CONSUMERS.get(consumer_name)
     if consumer is None or not template:
         return None
-    try:
-        parser = _parser(consumer.grammar)
-    except Exception:
-        return None
 
     text = f"{consumer.prefix}{template}{consumer.suffix}"
-    try:
-        tree = parser.parse(text.encode("utf-8"))
-    except Exception:
-        return None
-
     analysis = BoundaryAnalysis(consumer=consumer_name, template=template)
     offsets = _hole_offsets(text)
     if not offsets:
         analysis.no_holes = True
         return analysis
+
+    if consumer.classify is not None:
+        # Hand-written consumer: XPath, LDAP -- no tree-sitter grammar exists,
+        # so each hole is classified by a focused scan rather than a parse tree.
+        for index, offset in offsets:
+            position = consumer.classify(text, offset)
+            analysis.holes.append(Hole(index=index, position=position, chain=(consumer_name,)))
+        return analysis
+
+    try:
+        parser = _parser(consumer.grammar)
+    except Exception:
+        return None
+    try:
+        tree = parser.parse(text.encode("utf-8"))
+    except Exception:
+        return None
 
     for index, offset in offsets:
         chain = _chain(tree.root_node, offset)

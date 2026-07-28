@@ -400,7 +400,7 @@ class TaintConfig:
             "response.sendRedirect",
             # --- LDAP injection ---
             "DirContext.search", "InitialDirContext.search", "LdapContext.search",
-            "idc.search", "ctx.search",
+            "idc.search", "ctx.search", "ldap_search", "ldap_list",
             # --- XPath injection ---
             "XPath.evaluate", "xp.evaluate", "xpath.evaluate", "XPathExpression.evaluate",
             "selectNodes", "selectSingleNode",

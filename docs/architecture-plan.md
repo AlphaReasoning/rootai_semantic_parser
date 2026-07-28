@@ -172,10 +172,21 @@ wild samples, and no case claims a CVE number it cannot substantiate.
 fixed so downstream tooling can depend on it.
 *Check*: bundle contains template, positions, defences, path, route, question.
 
-### Step 7 — More consumers
-XPath, LDAP, regex (hand-written mini-parser; no tree-sitter grammar), template
-engines, format strings, YAML/pickle deserialization.
-*Check*: each consumer ships with mismatch cases in both directions.
+### Step 7 — More consumers (in progress)
+**XPath and LDAP done.** Neither has a tree-sitter grammar, so each is a
+hand-written character-scan classifier in the same `Consumer` framework (a
+`classify` callable instead of grammar `rules`). Same principle as SQL: a value
+in a string literal / filter value needs escaping; a value in a structural slot
+(node name, filter attribute, operator) cannot be escaped and needs an
+allowlist. Both ship with positive and negative controls in unit tests and the
+corpus, and both directions of the wrong-defence case (encoder on a structural
+position → MISMATCH). Sink→consumer map covers `xp.evaluate`/`XPath.compile`/
+`selectNodes` and Java `DirContext.search` (filter at arg 1) / PHP `ldap_search`
+(arg 2).
+*Still to do*: regex (ReDoS / pattern injection), template engines, format
+strings, YAML/pickle deserialization.
+*Check*: 386 tests; boundary corpus 30 in-scope cases at 100%/100%; OWASP
+xpathi/ldapi categories hold; overall floor unchanged.
 
 ### Step 8 — Confirmation loop (L5)
 `confirm` subcommand driving an LLM over evidence bundles, writing outcomes to
