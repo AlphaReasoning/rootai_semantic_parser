@@ -9,12 +9,12 @@ import os
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import streamlit as st
+from archive_utils import extract_zip_bytes
 from async_parse import scan_async
 from graph_queries import GraphQueryEngine, GraphQueryError, render_query_text
 from reports import GraphSnapshot
@@ -572,17 +572,7 @@ def _save_uploaded_file(uploaded_file, suffix: str = "") -> str:
 
 
 def _extract_zip(uploaded_zip) -> tuple[str, str]:
-    tmp_dir = tempfile.mkdtemp(prefix="rootai-archive-")
-    archive_path = os.path.join(tmp_dir, "upload.zip")
-    with open(archive_path, "wb") as handle:
-        handle.write(uploaded_zip.getbuffer())
-    with zipfile.ZipFile(archive_path, "r") as zip_ref:
-        zip_ref.extractall(tmp_dir)
-    extracted_roots = [path for path in Path(tmp_dir).iterdir() if path.name != "upload.zip"]
-    workspace_root = tmp_dir
-    if len(extracted_roots) == 1 and extracted_roots[0].is_dir():
-        workspace_root = str(extracted_roots[0])
-    return workspace_root, uploaded_zip.name
+    return extract_zip_bytes(bytes(uploaded_zip.getbuffer()), uploaded_zip.name)
 
 
 def _clone_repo(repo_url: str) -> tuple[str, str]:
