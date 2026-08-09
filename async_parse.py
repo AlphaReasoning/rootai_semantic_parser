@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Set
 from config import load_finding_profile, load_ruleset
 from core.runtime import CVEEnricher, MultiFileParser
 from feedback import apply_feedback_scores, load_feedback_db
-from export_utils import EXPORT_KEYS
+from export_utils import EXPORT_KEYS, compact_bounty_payload
 from models import AnalysisOptions, BountyReport, FindingProfile, SecurityConfig, TaintConfig
 from reports import (
     GraphSnapshot,
@@ -252,7 +252,7 @@ def scan_async(
         trace.append({"ts": time.time(), "stage": "report", "message": "Feedback-adjusted scoring applied."})
 
     report_dict = asdict(report)
-    bounty_dict = asdict(bounty)
+    bounty_dict = compact_bounty_payload(report_dict, asdict(bounty))
     trace.append({
         "ts": time.time(),
         "stage": "report",
@@ -284,6 +284,8 @@ def scan_async(
             "quick_mode": quick_mode,
             "workspace_path": workspace_path,
             "dependency_graph_count": len(external_graphs),
+            "artifact_contract_version": 2,
+            "graph_owner": "report",
             "trace_summary": _build_trace_summary(trace),
             "cli_preview": cli_preview,
         },

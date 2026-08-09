@@ -19,6 +19,7 @@ from async_parse import scan_async
 from export_utils import EXPORT_KEYS, build_snapshot_payload, render_export
 from graph_queries import GraphQueryEngine, GraphQueryError, render_query_text
 from reports import GraphSnapshot
+from scan_store import ScanArtifactStore
 
 
 SUPPORTED_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".cs", ".php", ".rb"}
@@ -376,7 +377,7 @@ def _ensure_state() -> None:
     st.session_state.setdefault("workspace_label", None)
     st.session_state.setdefault("workspace_source", None)
     st.session_state.setdefault("workspace_log", [])
-    st.session_state.setdefault("scan_result", None)
+    st.session_state.setdefault("scan_ref", None)
     st.session_state.setdefault("scan_timestamp", None)
     st.session_state.setdefault("scan_error", None)
     st.session_state.setdefault("use_case_mode", "Security Analysis")
@@ -398,6 +399,39 @@ def _session_store_dir() -> Path:
     base = Path.home() / ".cache" / "rootai-semantic-parser" / "ui-sessions"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+@st.cache_resource(show_spinner=False)
+def _artifact_store() -> ScanArtifactStore:
+    return ScanArtifactStore()
+
+
+@st.cache_resource(show_spinner=False)
+def _load_scan_artifact(scan_id: str) -> Dict[str, Any]:
+    return _artifact_store().load_scan(scan_id)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_export_artifact(scan_id: str, cache_key: str, text: bool) -> str | bytes | None:
+    return _artifact_store().load_export(scan_id, cache_key, text=text)
+
+
+def _current_scan_result() -> Dict[str, Any] | None:
+    reference = st.session_state.scan_ref
+    if reference:
+        try:
+            return _load_scan_artifact(reference["scan_id"])
+        except (FileNotFoundError, ValueError) as exc:
+            st.session_state.scan_error = str(exc)
+            return None
+
+    legacy_result = st.session_state.get("scan_result")
+    if legacy_result:
+        reference = _artifact_store().store_scan(legacy_result)
+        st.session_state.scan_ref = reference
+        del st.session_state["scan_result"]
+        return legacy_result
+    return None
 
 
 def _selected_mode() -> Dict[str, Any]:
@@ -545,6 +579,9 @@ def _build_security_pdf(report: Dict[str, Any], bounty: Dict[str, Any]) -> str:
 
 
 def _save_session() -> None:
+    if st.session_state.scan_ref and _current_scan_result() is None:
+        st.error("The current scan artifact is unavailable and the session was not saved.")
+        return
     payload = {
         "workspace_path": st.session_state.workspace_path,
         "workspace_label": st.session_state.workspace_label,
@@ -552,7 +589,7 @@ def _save_session() -> None:
         "use_case_mode": st.session_state.use_case_mode,
         "graph_query": st.session_state.graph_query,
         "scan_timestamp": st.session_state.scan_timestamp,
-        "scan_result": st.session_state.scan_result,
+        "scan_ref": st.session_state.scan_ref,
         "saved_at": datetime.utcnow().isoformat() + "Z",
     }
     path = _session_store_dir() / f"session-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.json"
@@ -573,7 +610,19 @@ def _load_most_recent_session() -> None:
     st.session_state.use_case_mode = raw.get("use_case_mode", st.session_state.use_case_mode)
     st.session_state.graph_query = raw.get("graph_query", st.session_state.graph_query)
     st.session_state.scan_timestamp = raw.get("scan_timestamp")
-    st.session_state.scan_result = raw.get("scan_result")
+    scan_ref = raw.get("scan_ref")
+    legacy_result = raw.get("scan_result")
+    if legacy_result:
+        scan_ref = _artifact_store().store_scan(legacy_result)
+    if scan_ref:
+        try:
+            _load_scan_artifact(scan_ref["scan_id"])
+        except (FileNotFoundError, ValueError) as exc:
+            st.error(f"Saved scan artifact is unavailable: {exc}")
+            return
+    st.session_state.scan_ref = scan_ref
+    st.session_state.pop("scan_result", None)
+    st.session_state.prepared_export = None
     st.session_state.session_save_path = str(sessions[-1])
     st.success(f"Loaded {sessions[-1].name}")
 
@@ -1025,12 +1074,15 @@ def _run_scan(options: Dict[str, Any]) -> None:
                 dependency_graph_paths=dependency_paths,
                 collaborator_base=options["collaborator_base"],
             )
+            scan_ref = _artifact_store().store_scan(result)
         except Exception as exc:
-            st.session_state.scan_result = None
+            st.session_state.scan_ref = None
+            st.session_state.pop("scan_result", None)
             st.session_state.scan_error = str(exc)
             st.error(f"Scan failed: {exc}")
             return
-    st.session_state.scan_result = result
+    st.session_state.scan_ref = scan_ref
+    st.session_state.pop("scan_result", None)
     st.session_state.collaborator_base = options["collaborator_base"]
     st.session_state.prepared_export = None
     st.session_state.scan_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1056,7 +1108,7 @@ def _render_execute_step(options: Dict[str, Any]) -> None:
     st.caption("Run the scan here. Open the sections below if you want the transcript, stage glossary, or execution metrics.")
     if st.button("Execute Semantic Scan", type="primary", use_container_width=True):
         _run_scan(options)
-    result = st.session_state.scan_result
+    result = _current_scan_result()
     if not result:
         if st.session_state.scan_error:
             st.error(f"Last run failed: {st.session_state.scan_error}")
@@ -1189,7 +1241,7 @@ def _render_code_reference(result: Dict[str, Any], selected_ids: List[str]) -> N
 
 def _render_understand_step() -> None:
     _render_step_intro("results")
-    result = st.session_state.scan_result
+    result = _current_scan_result()
     if not result:
         st.info("Run a scan first to populate results.")
         return
@@ -1333,31 +1385,52 @@ def _render_understand_step() -> None:
     )
 
 
-def _prepare_export(result: Dict[str, Any], export_key: str) -> Dict[str, Any]:
+def _prepare_export(
+    scan_ref: Dict[str, Any], result: Dict[str, Any], export_key: str
+) -> Dict[str, Any]:
     filename, mime = EXPORT_DOWNLOADS[export_key]
-    if export_key == "graph_snapshot":
-        data: Any = json.dumps(build_snapshot_payload(result["report"]), indent=2)
-    elif export_key == "neo4j_cypher":
-        data = _neo4j_export(result["report"]["graph"])
-    elif export_key == "security_pdf":
-        pdf_path = Path(_build_security_pdf(result["report"], result["bounty"]))
-        try:
-            data = pdf_path.read_bytes()
-        finally:
-            shutil.rmtree(pdf_path.parent, ignore_errors=True)
-    else:
-        data = render_export(
-            result["report"],
-            result["bounty"],
-            export_key,
-            collaborator_base=st.session_state.collaborator_base,
-        )
-    return {"key": export_key, "filename": filename, "mime": mime, "data": data}
+    scan_id = scan_ref["scan_id"]
+    collaborator_formats = {"submission_hackerone", "submission_bugcrowd", "poc_json"}
+    options = (
+        {"collaborator_base": st.session_state.collaborator_base}
+        if export_key in collaborator_formats
+        else {}
+    )
+    cache_key = _artifact_store().export_cache_key(export_key, options)
+    is_text = export_key != "security_pdf"
+    data = _artifact_store().load_export(scan_id, cache_key, text=is_text)
+    if data is None:
+        if export_key == "graph_snapshot":
+            data = json.dumps(build_snapshot_payload(result["report"]), indent=2)
+        elif export_key == "neo4j_cypher":
+            data = _neo4j_export(result["report"]["graph"])
+        elif export_key == "security_pdf":
+            pdf_path = Path(_build_security_pdf(result["report"], result["bounty"]))
+            try:
+                data = pdf_path.read_bytes()
+            finally:
+                shutil.rmtree(pdf_path.parent, ignore_errors=True)
+        else:
+            data = render_export(
+                result["report"],
+                result["bounty"],
+                export_key,
+                collaborator_base=st.session_state.collaborator_base,
+            )
+        _artifact_store().store_export(scan_id, cache_key, data)
+    return {
+        "key": export_key,
+        "filename": filename,
+        "mime": mime,
+        "scan_id": scan_id,
+        "cache_key": cache_key,
+        "is_text": is_text,
+    }
 
 
 def _render_export_step() -> None:
     _render_step_intro("export")
-    result = st.session_state.scan_result
+    result = _current_scan_result()
     if not result:
         st.info("Run a scan first to unlock the export deck.")
         return
@@ -1374,21 +1447,36 @@ def _render_export_step() -> None:
         )
         if st.button("Prepare Selected Artifact", use_container_width=True):
             try:
-                st.session_state.prepared_export = _prepare_export(result, selected_export)
+                st.session_state.prepared_export = _prepare_export(
+                    st.session_state.scan_ref, result, selected_export
+                )
             except Exception as exc:
                 st.error(f"Export failed: {exc}")
         prepared = st.session_state.prepared_export
-        if prepared and prepared["key"] == selected_export:
-            st.download_button(
-                label=f"Download {prepared['filename']}",
-                data=prepared["data"],
-                file_name=prepared["filename"],
-                mime=prepared["mime"],
-                use_container_width=True,
+        if prepared and "scan_id" not in prepared:
+            st.session_state.prepared_export = None
+            prepared = None
+        if (
+            prepared
+            and prepared["key"] == selected_export
+            and prepared["scan_id"] == st.session_state.scan_ref["scan_id"]
+        ):
+            data = _load_export_artifact(
+                prepared["scan_id"], prepared["cache_key"], prepared["is_text"]
             )
-            if isinstance(prepared["data"], str):
-                with st.expander("Preview prepared artifact", expanded=False):
-                    st.code(prepared["data"][:16000], language="text")
+            if data is None:
+                st.warning("Prepared artifact is no longer available; prepare it again.")
+            else:
+                st.download_button(
+                    label=f"Download {prepared['filename']}",
+                    data=data,
+                    file_name=prepared["filename"],
+                    mime=prepared["mime"],
+                    use_container_width=True,
+                )
+                if isinstance(data, str):
+                    with st.expander("Preview prepared artifact", expanded=False):
+                        st.code(data[:16000], language="text")
     with right:
         st.markdown("### Snapshot And Session Lab")
         uploaded_snapshot = st.file_uploader("Compare against prior snapshot", type=["json"], key="snapshot_compare")

@@ -31,6 +31,40 @@ EXPORT_KEYS = (
 )
 
 
+def build_bounty_graph(report_graph: Dict[str, Any]) -> Dict[str, Any]:
+    """Rebuild the historical slim bounty graph from the report-owned graph."""
+    return {
+        "nodes": [
+            {
+                "id": node["id"],
+                "label": node.get("label"),
+                "file": node.get("file"),
+                "lineno": node.get("lineno"),
+                "type": node.get("type"),
+            }
+            for node in report_graph.get("nodes", [])
+        ],
+        "edges": [
+            {
+                "source": edge["source"],
+                "target": edge["target"],
+                "relation": edge["relation"],
+            }
+            for edge in report_graph.get("edges", [])
+        ],
+    }
+
+
+def compact_bounty_payload(
+    report_payload: Dict[str, Any], bounty_payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Remove only a bounty graph reproducible from the report-owned graph."""
+    compact = dict(bounty_payload)
+    if compact.get("graph") == build_bounty_graph(report_payload.get("graph", {})):
+        compact.pop("graph", None)
+    return compact
+
+
 def render_export(
     report_payload: Dict[str, Any],
     bounty_payload: Dict[str, Any],
@@ -42,7 +76,9 @@ def render_export(
     if export_key not in EXPORT_KEYS and export_key != "web_ui_html":
         raise ValueError(f"unknown export format: {export_key}")
     report = ScanReport(**report_payload)
-    bounty = BountyReport(**bounty_payload)
+    bounty_fields = dict(bounty_payload)
+    bounty_fields.setdefault("graph", build_bounty_graph(report_payload["graph"]))
+    bounty = BountyReport(**bounty_fields)
 
     if export_key == "scan_json":
         return report.to_json()

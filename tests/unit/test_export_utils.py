@@ -5,7 +5,13 @@ import json
 import pytest
 
 import export_utils
-from export_utils import EXPORT_KEYS, build_snapshot_payload, render_export
+from export_utils import (
+    EXPORT_KEYS,
+    build_bounty_graph,
+    build_snapshot_payload,
+    compact_bounty_payload,
+    render_export,
+)
 
 
 @pytest.fixture
@@ -55,6 +61,34 @@ def test_duplicate_web_ui_html_is_a_compatibility_alias_not_an_advertised_export
     assert render_export(report_payload, bounty_payload, "web_ui_html") == render_export(
         report_payload, bounty_payload, "bounty_html"
     )
+
+
+def test_compact_bounty_payload_reuses_the_report_graph(report_payload, bounty_payload) -> None:
+    bounty_payload["graph"] = build_bounty_graph(report_payload["graph"])
+    compact_bounty = compact_bounty_payload(report_payload, bounty_payload)
+
+    rendered = json.loads(render_export(report_payload, compact_bounty, "bounty_json"))
+
+    assert "graph" not in compact_bounty
+    assert rendered["graph"] == build_bounty_graph(report_payload["graph"])
+
+
+def test_compaction_preserves_a_distinct_bounty_graph(report_payload, bounty_payload) -> None:
+    bounty_payload["graph"] = {"nodes": [], "edges": []}
+
+    compact_bounty = compact_bounty_payload(report_payload, bounty_payload)
+
+    assert compact_bounty["graph"] == {"nodes": [], "edges": []}
+
+
+def test_compact_payload_preserves_every_export(report_payload, bounty_payload) -> None:
+    bounty_payload["graph"] = build_bounty_graph(report_payload["graph"])
+    compact_bounty = compact_bounty_payload(report_payload, bounty_payload)
+
+    for export_key in EXPORT_KEYS:
+        assert render_export(report_payload, compact_bounty, export_key) == render_export(
+            report_payload, bounty_payload, export_key
+        )
 
 
 def test_only_the_requested_renderer_runs(monkeypatch, report_payload, bounty_payload) -> None:
