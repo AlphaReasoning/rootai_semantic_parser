@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List
 import streamlit as st
 from archive_utils import extract_zip_bytes
 from async_parse import scan_async
+from export_utils import EXPORT_KEYS, build_snapshot_payload, render_export
 from graph_queries import GraphQueryEngine, GraphQueryError, render_query_text
 from reports import GraphSnapshot
 
@@ -58,6 +59,24 @@ EXPORT_GUIDE = [
     ("`poc-hints.json`", "Payload ideas and reproduction helpers for the top ranked findings."),
     ("`graph-snapshot.json`", "Before/after structural diffing between scans."),
 ]
+EXPORT_DOWNLOADS = {
+    "scan_json": ("scan-report.json", "application/json"),
+    "scan_text": ("scan-report.txt", "text/plain"),
+    "llm_markdown": ("llm-context.md", "text/markdown"),
+    "bounty_json": ("bounty-report.json", "application/json"),
+    "bounty_markdown": ("bounty-report.md", "text/markdown"),
+    "bounty_html": ("bounty-report.html", "text/html"),
+    "sarif": ("rootai.sarif", "application/json"),
+    "github_annotations": ("github-annotations.json", "application/json"),
+    "gitlab_annotations": ("gitlab-annotations.json", "application/json"),
+    "bitbucket_annotations": ("bitbucket-annotations.json", "application/json"),
+    "submission_hackerone": ("hackerone-submission.md", "text/markdown"),
+    "submission_bugcrowd": ("bugcrowd-submission.md", "text/markdown"),
+    "poc_json": ("poc-hints.json", "application/json"),
+    "graph_snapshot": ("graph-snapshot.json", "application/json"),
+    "neo4j_cypher": ("graph.neo4j.cypher", "text/plain"),
+    "security_pdf": ("security-report.pdf", "application/pdf"),
+}
 STAGE_EXPLAINERS = {
     "plan": "RootAI locks in the mission profile, thresholds, and optional rule packs before touching source.",
     "discover": "The repo is walked and reduced to parser-relevant files. Quick mode trims tests and fixtures to accelerate demos.",
@@ -365,6 +384,8 @@ def _ensure_state() -> None:
     st.session_state.setdefault("graph_query", USE_CASE_MODES["Security Analysis"]["query"])
     st.session_state.setdefault("selected_finding", 1)
     st.session_state.setdefault("session_save_path", None)
+    st.session_state.setdefault("collaborator_base", "")
+    st.session_state.setdefault("prepared_export", None)
 
 
 def _log_workspace(message: str) -> None:
@@ -1010,6 +1031,8 @@ def _run_scan(options: Dict[str, Any]) -> None:
             st.error(f"Scan failed: {exc}")
             return
     st.session_state.scan_result = result
+    st.session_state.collaborator_base = options["collaborator_base"]
+    st.session_state.prepared_export = None
     st.session_state.scan_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     st.session_state.selected_finding = 1
 
@@ -1310,6 +1333,28 @@ def _render_understand_step() -> None:
     )
 
 
+def _prepare_export(result: Dict[str, Any], export_key: str) -> Dict[str, Any]:
+    filename, mime = EXPORT_DOWNLOADS[export_key]
+    if export_key == "graph_snapshot":
+        data: Any = json.dumps(build_snapshot_payload(result["report"]), indent=2)
+    elif export_key == "neo4j_cypher":
+        data = _neo4j_export(result["report"]["graph"])
+    elif export_key == "security_pdf":
+        pdf_path = Path(_build_security_pdf(result["report"], result["bounty"]))
+        try:
+            data = pdf_path.read_bytes()
+        finally:
+            shutil.rmtree(pdf_path.parent, ignore_errors=True)
+    else:
+        data = render_export(
+            result["report"],
+            result["bounty"],
+            export_key,
+            collaborator_base=st.session_state.collaborator_base,
+        )
+    return {"key": export_key, "filename": filename, "mime": mime, "data": data}
+
+
 def _render_export_step() -> None:
     _render_step_intro("export")
     result = st.session_state.scan_result
@@ -1317,67 +1362,44 @@ def _render_export_step() -> None:
         st.info("Run a scan first to unlock the export deck.")
         return
 
-    exports = result["exports"]
-    pdf_path = _build_security_pdf(result["report"], result["bounty"])
-    neo4j_text = _neo4j_export(result["report"]["graph"])
-    downloads = [
-        ("scan_json", "scan-report.json", "application/json"),
-        ("scan_text", "scan-report.txt", "text/plain"),
-        ("llm_markdown", "llm-context.md", "text/markdown"),
-        ("bounty_json", "bounty-report.json", "application/json"),
-        ("bounty_markdown", "bounty-report.md", "text/markdown"),
-        ("bounty_html", "bounty-report.html", "text/html"),
-        ("sarif", "rootai.sarif", "application/json"),
-        ("github_annotations", "github-annotations.json", "application/json"),
-        ("gitlab_annotations", "gitlab-annotations.json", "application/json"),
-        ("bitbucket_annotations", "bitbucket-annotations.json", "application/json"),
-        ("submission_hackerone", "hackerone-submission.md", "text/markdown"),
-        ("submission_bugcrowd", "bugcrowd-submission.md", "text/markdown"),
-        ("poc_json", "poc-hints.json", "application/json"),
-    ]
     left, right = st.columns([0.92, 1.08], gap="large")
     with left:
         st.markdown("### Download Center")
-        for key, filename, mime in downloads:
-            st.download_button(
-                label=f"Download {filename}",
-                data=exports[key],
-                file_name=filename,
-                mime=mime,
-                use_container_width=True,
-            )
-        st.download_button(
-            "Download graph.neo4j.cypher",
-            data=neo4j_text,
-            file_name="graph.neo4j.cypher",
-            mime="text/plain",
-            use_container_width=True,
+        available = [key for key in result.get("export_options", EXPORT_KEYS) if key in EXPORT_DOWNLOADS]
+        available.extend(["graph_snapshot", "neo4j_cypher", "security_pdf"])
+        selected_export = st.selectbox(
+            "Artifact",
+            available,
+            format_func=lambda key: EXPORT_DOWNLOADS[key][0],
         )
-        with open(pdf_path, "rb") as handle:
+        if st.button("Prepare Selected Artifact", use_container_width=True):
+            try:
+                st.session_state.prepared_export = _prepare_export(result, selected_export)
+            except Exception as exc:
+                st.error(f"Export failed: {exc}")
+        prepared = st.session_state.prepared_export
+        if prepared and prepared["key"] == selected_export:
             st.download_button(
-                "Download security-report.pdf",
-                data=handle.read(),
-                file_name="security-report.pdf",
-                mime="application/pdf",
+                label=f"Download {prepared['filename']}",
+                data=prepared["data"],
+                file_name=prepared["filename"],
+                mime=prepared["mime"],
                 use_container_width=True,
             )
+            if isinstance(prepared["data"], str):
+                with st.expander("Preview prepared artifact", expanded=False):
+                    st.code(prepared["data"][:16000], language="text")
     with right:
         st.markdown("### Snapshot And Session Lab")
-        snapshot_payload = json.dumps(result["snapshot"], indent=2)
-        st.download_button(
-            "Download current graph snapshot",
-            data=snapshot_payload,
-            file_name="graph-snapshot.json",
-            mime="application/json",
-            use_container_width=True,
-        )
         uploaded_snapshot = st.file_uploader("Compare against prior snapshot", type=["json"], key="snapshot_compare")
         if uploaded_snapshot is not None:
-            current_tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-            current_tmp.write(snapshot_payload)
-            current_tmp.close()
+            current_payload = build_snapshot_payload(result["report"])
             prior_path = _save_uploaded_file(uploaded_snapshot)
-            current_snapshot = GraphSnapshot.load(current_tmp.name)
+            current_snapshot = GraphSnapshot(
+                current_payload["node_hashes"],
+                set(current_payload["edge_hashes"]),
+                current_payload["graph"],
+            )
             prior_snapshot = GraphSnapshot.load(prior_path)
             diff = prior_snapshot.diff(current_snapshot)
             st.json(
@@ -1397,9 +1419,6 @@ def _render_export_step() -> None:
             st.metric("Edges", result["report"]["edge_count"])
         with metric_cols[2]:
             st.metric("Taint paths", result["report"]["taint_path_count"])
-        with st.expander("Preview export payload", expanded=False):
-            preview_key = st.selectbox("Export preview", list(exports.keys()))
-            st.code(exports[preview_key][:16000], language="text")
     st.markdown("### Export Guide")
     st.caption("Every export exists for a different audience. This is the usefulness and execution layer: the scan should end in something immediately shareable, automatable, or demo-ready.")
     st.table(

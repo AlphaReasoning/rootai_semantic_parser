@@ -10,15 +10,12 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Set
 from config import load_finding_profile, load_ruleset
 from core.runtime import CVEEnricher, MultiFileParser
 from feedback import apply_feedback_scores, load_feedback_db
+from export_utils import EXPORT_KEYS
 from models import AnalysisOptions, BountyReport, FindingProfile, SecurityConfig, TaintConfig
 from reports import (
     GraphSnapshot,
     apply_baseline_and_suppressions,
-    bounty_report_to_submission_markdown,
     build_bounty_report,
-    export_llm_context,
-    generate_poc_hints,
-    render_bounty_output,
 )
 
 
@@ -191,7 +188,7 @@ def scan_async(
     dependency_graph_paths: Optional[Sequence[str]] = None,
     collaborator_base: str = "",
 ) -> Dict[str, Any]:
-    """Run a full parser scan and return UI-friendly structured payloads."""
+    """Run a scan and return UI payloads without materializing export artifacts."""
     trace: list[Dict[str, Any]] = []
 
     def _record(event: Dict[str, Any]) -> None:
@@ -254,33 +251,13 @@ def scan_async(
         bounty = apply_feedback_scores(bounty, load_feedback_db(feedback_db_path))
         trace.append({"ts": time.time(), "stage": "report", "message": "Feedback-adjusted scoring applied."})
 
-    snapshot = GraphSnapshot.from_graph(report.graph)
     report_dict = asdict(report)
     bounty_dict = asdict(bounty)
-    trace.append({"ts": time.time(), "stage": "report", "message": "Snapshot and export payloads prepared."})
-    exports = {
-        "scan_json": report.to_json(),
-        "scan_text": report.to_text(),
-        "llm_markdown": export_llm_context(report.graph, report.taint_paths),
-        "bounty_json": bounty.to_json(),
-        "bounty_markdown": render_bounty_output(bounty, "bounty-markdown"),
-        "bounty_html": render_bounty_output(bounty, "bounty-html"),
-        "web_ui_html": render_bounty_output(bounty, "bounty-html"),
-        "sarif": render_bounty_output(bounty, "sarif"),
-        "github_annotations": render_bounty_output(bounty, "github-annotations"),
-        "gitlab_annotations": render_bounty_output(bounty, "gitlab-annotations"),
-        "bitbucket_annotations": render_bounty_output(bounty, "bitbucket-annotations"),
-        "submission_hackerone": bounty_report_to_submission_markdown(
-            bounty, "HackerOne", collaborator_base=collaborator_base
-        ),
-        "submission_bugcrowd": bounty_report_to_submission_markdown(
-            bounty, "Bugcrowd", collaborator_base=collaborator_base
-        ),
-        "poc_json": json.dumps(
-            [generate_poc_hints(finding, collaborator_base=collaborator_base) for finding in bounty.findings[:10]],
-            indent=2,
-        ),
-    }
+    trace.append({
+        "ts": time.time(),
+        "stage": "report",
+        "message": "Interactive report payload prepared; exports deferred until requested.",
+    })
     cli_preview = _build_cli_preview(
         workspace_path=workspace_path,
         profile=profile,
@@ -299,13 +276,7 @@ def scan_async(
     return {
         "report": report_dict,
         "bounty": bounty_dict,
-        "exports": exports,
-        "snapshot": {
-            "fingerprint": snapshot.fingerprint,
-            "graph": snapshot.full_graph,
-            "node_hashes": snapshot._node_hashes,
-            "edge_hashes": sorted(snapshot._edge_hashes),
-        },
+        "export_options": list(EXPORT_KEYS),
         "meta": {
             "profile": finding_profile.name,
             "profile_description": finding_profile.description,
